@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ static int append_message_to_record_data(char **result_buffer,
 {
     int                result = FLB_MAP_NOT_MODIFIED;
     char              *modified_data_buffer;
-    int                modified_data_size;
+    size_t             modified_data_size;
     msgpack_object_kv *new_map_entries[1];
     msgpack_object_kv  message_entry;
     *result_buffer = NULL;
@@ -205,6 +205,7 @@ int syslog_prot_process(struct syslog_conn *conn)
 {
     int len;
     int ret;
+    int status = 0;
     char *p;
     char *eof;
     char *end;
@@ -218,34 +219,74 @@ int syslog_prot_process(struct syslog_conn *conn)
 
     flb_log_event_encoder_reset(ctx->log_encoder);
 
-    /* Always parse while some remaining bytes exists */
+    /* Always parse while some remaining bytes exist */
     while (eof < end) {
-        /* Lookup the ending byte */
-        eof = p = conn->buf_data + conn->buf_parsed;
-        while (*eof != '\n' && *eof != '\0' && eof < end) {
-            eof++;
-        }
-
-        /* Incomplete message */
-        if (eof == end || (*eof != '\n' && *eof != '\0')) {
-            break;
-        }
-
-        /* No data ? */
-        len = (eof - p);
-        if (len == 0) {
-            consume_bytes(conn->buf_data, 1, conn->buf_len);
-            conn->buf_len--;
-            conn->buf_parsed = 0;
-            conn->buf_data[conn->buf_len] = '\0';
-            end = conn->buf_data + conn->buf_len;
-
-            if (conn->buf_len == 0) {
+        if (ctx->frame_type == FLB_SYSLOG_FRAME_NEWLINE) {
+            /* newline framing (current behavior) */
+            eof = p = conn->buf_data + conn->buf_parsed;
+            while (*eof != '\n' && *eof != '\0' && eof < end) {
+                eof++;
+            }
+            /* Incomplete message */
+            if (eof == end || (*eof != '\n' && *eof != '\0')) {
                 break;
             }
+            len = (eof - p);
+        }
+        else {
+            /* RFC 6587 octet-counting framing: <len> SP <msg> */
+            p = conn->buf_data + conn->buf_parsed;
 
+            if (!conn->frame_have_len) {
+                char *sp = p;
+                size_t n = 0;
+
+                if (p == end) {
+                    break;
+                }
+                /* RFC 6587 MSG-LEN starts with a nonzero digit. */
+                if (*p < '1' || *p > '9') {
+                    flb_plg_warn(ctx->ins, "invalid octet-counting length");
+                    status = -1;
+                    break;
+                }
+                while (sp < end && *sp >= '0' && *sp <= '9') {
+                    if (n >= SIZE_MAX / 10) {
+                        n = SIZE_MAX;
+                        break;
+                    }
+                    n = n * 10 + (size_t)(*sp - '0');
+                    sp++;
+                }
+                if (sp == end) {
+                    break;
+                }
+                if (*sp != ' ') {
+                    flb_plg_warn(ctx->ins, "invalid octet-counting length");
+                    status = -1;
+                    break;
+                }
+                conn->buf_parsed += (sp - p) + 1;
+                conn->frame_expected_len = n;
+                conn->frame_have_len = 1;
+                p = conn->buf_data + conn->buf_parsed;
+                end = conn->buf_data + conn->buf_len;
+            }
+            if ((size_t)(end - p) < conn->frame_expected_len) {
+                break;
+            }
+            len = (int)conn->frame_expected_len;
+        }
+
+        /* Skip an empty newline frame without replaying earlier messages. */
+        if (len == 0) {
+            conn->buf_parsed++;
+            eof = conn->buf_data + conn->buf_parsed;
             continue;
         }
+
+        /* Parsers without a time key leave the output timestamp untouched. */
+        flb_time_zero(&out_time);
 
         /* Process the string */
         ret = flb_parser_do(ctx->parser, p, len,
@@ -266,7 +307,18 @@ int syslog_prot_process(struct syslog_conn *conn)
             flb_plg_debug(ctx->ins, "unparsed log message: %.*s", len, p);
         }
 
-        conn->buf_parsed += len + 1;
+        if (ctx->frame_type == FLB_SYSLOG_FRAME_NEWLINE) {
+            conn->buf_parsed += len + 1;
+        }
+        else {
+            conn->buf_parsed += len;
+            conn->frame_expected_len = 0;
+            conn->frame_have_len = 0;
+            if (conn->buf_parsed < conn->buf_len &&
+                conn->buf_data[conn->buf_parsed] == '\n') {
+                conn->buf_parsed += 1;
+            }
+        }
         end = conn->buf_data + conn->buf_len;
         eof = conn->buf_data + conn->buf_parsed;
     }
@@ -284,7 +336,7 @@ int syslog_prot_process(struct syslog_conn *conn)
                              ctx->log_encoder->output_length);
     }
 
-    return 0;
+    return status;
 }
 
 int syslog_prot_process_udp(struct syslog_conn *conn)

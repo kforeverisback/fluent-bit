@@ -1,4 +1,5 @@
 set(UNIT_TESTS_FILES
+  protobuf.c
   basic.c
   gauge.c
   counter.c
@@ -8,10 +9,17 @@ set(UNIT_TESTS_FILES
   atomic_operations.c
   encoding.c
   decoding.c
+  opentelemetry.c
   cat.c
   issues.c
   null_label.c
   filter.c
+  exp_histogram.c
+  msgpack_security.c
+  msgpack_abi.c
+  msgpack_temporality.c
+  format_conversion.c
+  expire.c
   )
 
 if (CMT_BUILD_PROMETHEUS_TEXT_DECODER)

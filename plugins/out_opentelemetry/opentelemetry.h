@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #define FLB_OUT_OPENTELEMETRY_H
 
 #include <fluent-bit/flb_output_plugin.h>
+#include <fluent-bit/flb_oauth2.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_ra_key.h>
 #include <fluent-bit/flb_http_client.h>
@@ -41,6 +42,9 @@
  * including the ones that succeeded. This is not ideal.
  */
 #define DEFAULT_LOG_RECORD_BATCH_SIZE "1000"
+#define DEFAULT_MAX_RESOURCE_EXPORT   "0"    /* no resource limits */
+#define DEFAULT_MAX_SCOPE_EXPORT      "0"    /* no scope limits */
+#define DEFAULT_METRICS_MAX_DATAPOINTS "0"    /* no data point limit */
 
 struct opentelemetry_body_key {
     flb_sds_t key;
@@ -57,6 +61,9 @@ struct opentelemetry_context {
     /* HTTP Auth */
     char *http_user;
     char *http_passwd;
+    struct flb_oauth2_config oauth2_config;
+    struct flb_oauth2 *oauth2_ctx;
+    const char *oauth2_auth_method;
 
     /* AWS Auth */
 #ifdef FLB_HAVE_SIGNV4
@@ -139,6 +146,15 @@ struct opentelemetry_context {
     /* Number of logs to flush at a time */
     int batch_size;
 
+    /* Maximum number of metric data points per OTLP export request */
+    int metrics_max_datapoints;
+
+    /* Maximum number of resources per OTLP export */
+    int max_resources;
+
+    /* Maximum number of scopes per OTLP resource */
+    int max_scopes;
+
     /* Log the response payload */
     int log_response_payload;
 
@@ -178,6 +194,9 @@ struct opentelemetry_context {
     /* compression: zstd */
     int compress_zstd;
 
+    /* cutoff threshold */
+    int cutoff_threshold;
+
     /* FLB/OTLP Record accessor patterns */
     struct flb_record_accessor *ra_meta_schema;
     struct flb_record_accessor *ra_meta_resource_id;
@@ -206,4 +225,6 @@ int opentelemetry_post(struct opentelemetry_context *ctx,
                        const char *tag, int tag_len,
                        const char *http_uri,
                        const char *grpc_uri);
+
+void otel_metrics_apply_cutoff(struct cmt *cmt, int threshold_seconds);
 #endif

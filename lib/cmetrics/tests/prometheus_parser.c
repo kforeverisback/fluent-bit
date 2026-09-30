@@ -79,7 +79,7 @@ void test_header_help()
     TEST_CHECK(f->context.metric.type == 0);
     cfl_sds_destroy(f->context.metric.name_orig);
     cfl_sds_destroy(f->context.metric.docstring);
-    free(f->context.metric.ns);
+    free(f->context.metric.name_buf);
 
     destroy(f);
 }
@@ -97,7 +97,7 @@ void test_header_type()
     TEST_CHECK(f->context.metric.type == COUNTER);
     TEST_CHECK(f->context.metric.docstring == NULL);
     cfl_sds_destroy(f->context.metric.name_orig);
-    free(f->context.metric.ns);
+    free(f->context.metric.name_buf);
 
     destroy(f);
 }
@@ -118,7 +118,7 @@ void test_header_help_type()
     TEST_CHECK(f->context.metric.type == SUMMARY);
     cfl_sds_destroy(f->context.metric.name_orig);
     cfl_sds_destroy(f->context.metric.docstring);
-    free(f->context.metric.ns);
+    free(f->context.metric.name_buf);
 
     destroy(f);
 }
@@ -139,9 +139,67 @@ void test_header_type_help()
     TEST_CHECK(f->context.metric.type == GAUGE);
     cfl_sds_destroy(f->context.metric.name_orig);
     cfl_sds_destroy(f->context.metric.docstring);
-    free(f->context.metric.ns);
+    free(f->context.metric.name_buf);
 
     destroy(f);
+}
+
+void test_metric_name_ownership()
+{
+    struct fixture *f;
+
+    f = init(START_HEADER, "# TYPE metric counter\n");
+    TEST_ASSERT(parse(f) == 0);
+    TEST_CHECK(strcmp(f->context.metric.ns, "") == 0);
+    TEST_CHECK(strcmp(f->context.metric.subsystem, "") == 0);
+    TEST_CHECK(strcmp(f->context.metric.name, "metric") == 0);
+    TEST_CHECK(f->context.metric.name_buf != NULL);
+    cfl_sds_destroy(f->context.metric.name_orig);
+    free(f->context.metric.name_buf);
+    destroy(f);
+
+    f = init(START_HEADER, "# TYPE namespace_metric counter\n");
+    TEST_ASSERT(parse(f) == 0);
+    TEST_CHECK(strcmp(f->context.metric.ns, "namespace") == 0);
+    TEST_CHECK(strcmp(f->context.metric.subsystem, "") == 0);
+    TEST_CHECK(strcmp(f->context.metric.name, "metric") == 0);
+    TEST_CHECK(f->context.metric.name_buf == f->context.metric.ns);
+    cfl_sds_destroy(f->context.metric.name_orig);
+    free(f->context.metric.name_buf);
+    destroy(f);
+}
+
+void test_metric_name_ownership_resets()
+{
+    int status;
+    struct cmt *cmt = NULL;
+    const char *input =
+        "# TYPE metric gauge\n"
+        "metric 1\n"
+        "# TYPE namespace_metric gauge\n"
+        "namespace_metric 2\n"
+        "# TYPE namespace_subsystem_metric gauge\n"
+        "namespace_subsystem_metric 3\n";
+
+    status = cmt_decode_prometheus_create(&cmt, input, 0, NULL);
+    TEST_ASSERT(status == CMT_DECODE_PROMETHEUS_SUCCESS);
+    TEST_ASSERT(cmt != NULL);
+    cmt_decode_prometheus_destroy(cmt);
+}
+
+void test_metric_name_ownership_error_cleanup()
+{
+    int status;
+    struct cmt *cmt = NULL;
+
+    status = cmt_decode_prometheus_create(&cmt,
+            "# TYPE metric counter\nmetric {key=", 0, NULL);
+    TEST_CHECK(status == CMT_DECODE_PROMETHEUS_SYNTAX_ERROR);
+
+    status = cmt_decode_prometheus_create(&cmt,
+            "# TYPE namespace_subsystem_metric counter\n"
+            "namespace_subsystem_metric {key=", 0, NULL);
+    TEST_CHECK(status == CMT_DECODE_PROMETHEUS_SYNTAX_ERROR);
 }
 
 struct cmt_decode_prometheus_context_sample *add_empty_sample(struct fixture *f)
@@ -692,6 +750,26 @@ void test_histogram_labels()
     cmt_decode_prometheus_destroy(cmt);
 }
 
+void test_histogram_missing_le_label()
+{
+    int status;
+    struct cmt *cmt;
+    struct cmt_decode_prometheus_parse_opts opts;
+
+    cmt = NULL;
+    memset(&opts, 0, sizeof(opts));
+
+    status = cmt_decode_prometheus_create(&cmt,
+            "# HELP test_histogram A histogram missing the le label.\n"
+            "# TYPE test_histogram histogram\n"
+            "test_histogram_bucket{foo=\"bar\"} 1\n"
+            "test_histogram_bucket{foo=\"baz\"} 2\n"
+            "test_histogram_sum 3.5\n"
+            "test_histogram_count 2\n", 0, &opts);
+
+    TEST_CHECK(status == CMT_DECODE_PROMETHEUS_SYNTAX_ERROR);
+}
+
 void test_summary()
 {
     int status;
@@ -1064,8 +1142,8 @@ void test_issue_fluent_bit_6021()
         "envoy_http_downstream_cx_length_ms_bucket{le=\"60000.0\",envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
         "envoy_http_downstream_cx_length_ms_bucket{le=\"300000.0\",envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
         "envoy_http_downstream_cx_length_ms_bucket{le=\"600000.0\",envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
-        "envoy_http_downstream_cx_length_ms_bucket{le=\"1.8e+06\",envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
-        "envoy_http_downstream_cx_length_ms_bucket{le=\"3.6e+06\",envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
+        "envoy_http_downstream_cx_length_ms_bucket{le=\"1800000.0\",envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
+        "envoy_http_downstream_cx_length_ms_bucket{le=\"3600000.0\",envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
         "envoy_http_downstream_cx_length_ms_bucket{le=\"+Inf\",envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
         "envoy_http_downstream_cx_length_ms_sum{envoy_http_conn_manager_prefix=\"admin\"} 15.5 0\n"
         "envoy_http_downstream_cx_length_ms_count{envoy_http_conn_manager_prefix=\"admin\"} 1 0\n"
@@ -1086,8 +1164,8 @@ void test_issue_fluent_bit_6021()
         "envoy_http_downstream_cx_length_ms_bucket{le=\"60000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_cx_length_ms_bucket{le=\"300000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_cx_length_ms_bucket{le=\"600000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
-        "envoy_http_downstream_cx_length_ms_bucket{le=\"1.8e+06\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
-        "envoy_http_downstream_cx_length_ms_bucket{le=\"3.6e+06\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
+        "envoy_http_downstream_cx_length_ms_bucket{le=\"1800000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
+        "envoy_http_downstream_cx_length_ms_bucket{le=\"3600000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_cx_length_ms_bucket{le=\"+Inf\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_cx_length_ms_sum{envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_cx_length_ms_count{envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
@@ -1110,8 +1188,8 @@ void test_issue_fluent_bit_6021()
         "envoy_http_downstream_rq_time_bucket{le=\"60000.0\",envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
         "envoy_http_downstream_rq_time_bucket{le=\"300000.0\",envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
         "envoy_http_downstream_rq_time_bucket{le=\"600000.0\",envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
-        "envoy_http_downstream_rq_time_bucket{le=\"1.8e+06\",envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
-        "envoy_http_downstream_rq_time_bucket{le=\"3.6e+06\",envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
+        "envoy_http_downstream_rq_time_bucket{le=\"1800000.0\",envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
+        "envoy_http_downstream_rq_time_bucket{le=\"3600000.0\",envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
         "envoy_http_downstream_rq_time_bucket{le=\"+Inf\",envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
         "envoy_http_downstream_rq_time_sum{envoy_http_conn_manager_prefix=\"admin\"} 25.5 0\n"
         "envoy_http_downstream_rq_time_count{envoy_http_conn_manager_prefix=\"admin\"} 10 0\n"
@@ -1132,8 +1210,8 @@ void test_issue_fluent_bit_6021()
         "envoy_http_downstream_rq_time_bucket{le=\"60000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_rq_time_bucket{le=\"300000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_rq_time_bucket{le=\"600000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
-        "envoy_http_downstream_rq_time_bucket{le=\"1.8e+06\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
-        "envoy_http_downstream_rq_time_bucket{le=\"3.6e+06\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
+        "envoy_http_downstream_rq_time_bucket{le=\"1800000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
+        "envoy_http_downstream_rq_time_bucket{le=\"3600000.0\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_rq_time_bucket{le=\"+Inf\",envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_rq_time_sum{envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
         "envoy_http_downstream_rq_time_count{envoy_http_conn_manager_prefix=\"ingress_http\"} 0 0\n"
@@ -1156,8 +1234,8 @@ void test_issue_fluent_bit_6021()
         "envoy_listener_admin_downstream_cx_length_ms_bucket{le=\"60000.0\"} 1 0\n"
         "envoy_listener_admin_downstream_cx_length_ms_bucket{le=\"300000.0\"} 1 0\n"
         "envoy_listener_admin_downstream_cx_length_ms_bucket{le=\"600000.0\"} 1 0\n"
-        "envoy_listener_admin_downstream_cx_length_ms_bucket{le=\"1.8e+06\"} 1 0\n"
-        "envoy_listener_admin_downstream_cx_length_ms_bucket{le=\"3.6e+06\"} 1 0\n"
+        "envoy_listener_admin_downstream_cx_length_ms_bucket{le=\"1800000.0\"} 1 0\n"
+        "envoy_listener_admin_downstream_cx_length_ms_bucket{le=\"3600000.0\"} 1 0\n"
         "envoy_listener_admin_downstream_cx_length_ms_bucket{le=\"+Inf\"} 1 0\n"
         "envoy_listener_admin_downstream_cx_length_ms_sum 15.5 0\n"
         "envoy_listener_admin_downstream_cx_length_ms_count 1 0\n"
@@ -1180,8 +1258,8 @@ void test_issue_fluent_bit_6021()
         "envoy_listener_downstream_cx_length_ms_bucket{le=\"60000.0\",envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
         "envoy_listener_downstream_cx_length_ms_bucket{le=\"300000.0\",envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
         "envoy_listener_downstream_cx_length_ms_bucket{le=\"600000.0\",envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
-        "envoy_listener_downstream_cx_length_ms_bucket{le=\"1.8e+06\",envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
-        "envoy_listener_downstream_cx_length_ms_bucket{le=\"3.6e+06\",envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
+        "envoy_listener_downstream_cx_length_ms_bucket{le=\"1800000.0\",envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
+        "envoy_listener_downstream_cx_length_ms_bucket{le=\"3600000.0\",envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
         "envoy_listener_downstream_cx_length_ms_bucket{le=\"+Inf\",envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
         "envoy_listener_downstream_cx_length_ms_sum{envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
         "envoy_listener_downstream_cx_length_ms_count{envoy_listener_address=\"0.0.0.0_10000\"} 0 0\n"
@@ -1204,8 +1282,8 @@ void test_issue_fluent_bit_6021()
         "envoy_listener_manager_lds_update_duration_bucket{le=\"60000.0\"} 0 0\n"
         "envoy_listener_manager_lds_update_duration_bucket{le=\"300000.0\"} 0 0\n"
         "envoy_listener_manager_lds_update_duration_bucket{le=\"600000.0\"} 0 0\n"
-        "envoy_listener_manager_lds_update_duration_bucket{le=\"1.8e+06\"} 0 0\n"
-        "envoy_listener_manager_lds_update_duration_bucket{le=\"3.6e+06\"} 0 0\n"
+        "envoy_listener_manager_lds_update_duration_bucket{le=\"1800000.0\"} 0 0\n"
+        "envoy_listener_manager_lds_update_duration_bucket{le=\"3600000.0\"} 0 0\n"
         "envoy_listener_manager_lds_update_duration_bucket{le=\"+Inf\"} 0 0\n"
         "envoy_listener_manager_lds_update_duration_sum 0 0\n"
         "envoy_listener_manager_lds_update_duration_count 0 0\n"
@@ -1228,8 +1306,8 @@ void test_issue_fluent_bit_6021()
         "envoy_sds_tls_sds_update_duration_bucket{le=\"60000.0\"} 0 0\n"
         "envoy_sds_tls_sds_update_duration_bucket{le=\"300000.0\"} 0 0\n"
         "envoy_sds_tls_sds_update_duration_bucket{le=\"600000.0\"} 0 0\n"
-        "envoy_sds_tls_sds_update_duration_bucket{le=\"1.8e+06\"} 0 0\n"
-        "envoy_sds_tls_sds_update_duration_bucket{le=\"3.6e+06\"} 0 0\n"
+        "envoy_sds_tls_sds_update_duration_bucket{le=\"1800000.0\"} 0 0\n"
+        "envoy_sds_tls_sds_update_duration_bucket{le=\"3600000.0\"} 0 0\n"
         "envoy_sds_tls_sds_update_duration_bucket{le=\"+Inf\"} 0 0\n"
         "envoy_sds_tls_sds_update_duration_sum 0 0\n"
         "envoy_sds_tls_sds_update_duration_count 0 0\n"
@@ -1252,8 +1330,8 @@ void test_issue_fluent_bit_6021()
         "envoy_server_initialization_time_ms_bucket{le=\"60000.0\"} 1 0\n"
         "envoy_server_initialization_time_ms_bucket{le=\"300000.0\"} 1 0\n"
         "envoy_server_initialization_time_ms_bucket{le=\"600000.0\"} 1 0\n"
-        "envoy_server_initialization_time_ms_bucket{le=\"1.8e+06\"} 1 0\n"
-        "envoy_server_initialization_time_ms_bucket{le=\"3.6e+06\"} 1 0\n"
+        "envoy_server_initialization_time_ms_bucket{le=\"1800000.0\"} 1 0\n"
+        "envoy_server_initialization_time_ms_bucket{le=\"3600000.0\"} 1 0\n"
         "envoy_server_initialization_time_ms_bucket{le=\"+Inf\"} 1 0\n"
         "envoy_server_initialization_time_ms_sum 30.5 0\n"
         "envoy_server_initialization_time_ms_count 1 0\n"
@@ -1382,19 +1460,19 @@ void test_pr_168()
         "prometheus_engine_query_duration_seconds{quantile=\"0.99\",slice=\"inner_eval\"} nan 0\n"
         "prometheus_engine_query_duration_seconds_sum{slice=\"inner_eval\"} 0 0\n"
         "prometheus_engine_query_duration_seconds_count{slice=\"inner_eval\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.5\",slice=\"prepare_time\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.9\",slice=\"prepare_time\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.99\",slice=\"prepare_time\"} 0 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.5\",slice=\"prepare_time\"} nan 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.9\",slice=\"prepare_time\"} nan 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.99\",slice=\"prepare_time\"} nan 0\n"
         "prometheus_engine_query_duration_seconds_sum{slice=\"prepare_time\"} 0 0\n"
         "prometheus_engine_query_duration_seconds_count{slice=\"prepare_time\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.5\",slice=\"queue_time\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.9\",slice=\"queue_time\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.99\",slice=\"queue_time\"} 0 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.5\",slice=\"queue_time\"} nan 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.9\",slice=\"queue_time\"} nan 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.99\",slice=\"queue_time\"} nan 0\n"
         "prometheus_engine_query_duration_seconds_sum{slice=\"queue_time\"} 0 0\n"
         "prometheus_engine_query_duration_seconds_count{slice=\"queue_time\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.5\",slice=\"result_sort\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.9\",slice=\"result_sort\"} 0 0\n"
-        "prometheus_engine_query_duration_seconds{quantile=\"0.99\",slice=\"result_sort\"} 0 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.5\",slice=\"result_sort\"} nan 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.9\",slice=\"result_sort\"} nan 0\n"
+        "prometheus_engine_query_duration_seconds{quantile=\"0.99\",slice=\"result_sort\"} nan 0\n"
         "prometheus_engine_query_duration_seconds_sum{slice=\"result_sort\"} 0 0\n"
         "prometheus_engine_query_duration_seconds_count{slice=\"result_sort\"} 0 0\n";
 
@@ -1690,11 +1768,246 @@ void test_issue_fluent_bit_9267()
     cfl_sds_destroy(in_buf);
 }
 
+// reproduces https://github.com/fluent/cmetrics/issues/274
+void test_issue_274()
+{
+    int status;
+    struct cmt *cmt;
+    cfl_sds_t in_buf = read_file(CMT_TESTS_DATA_PATH "/issue_274.txt");
+    size_t in_size = cfl_sds_len(in_buf);
+
+    status = cmt_decode_prometheus_create(&cmt, in_buf, in_size, NULL);
+    TEST_CHECK(status == 0);
+    cfl_sds_destroy(in_buf);
+    cmt_decode_prometheus_destroy(cmt);
+}
+
+void test_type_redeclared_summary_histogram()
+{
+    int status;
+    struct cmt *cmt;
+    struct cmt_decode_prometheus_parse_opts opts;
+    cfl_sds_t result;
+
+    memset(&opts, 0, sizeof(opts));
+
+    /* a summary re-declared as a histogram with the same name must not
+     * reuse the summary object as a histogram */
+    status = cmt_decode_prometheus_create(&cmt,
+        "# TYPE s summary\n"
+        "s{quantile=\"0.5\"} 1\n"
+        "s_sum 1\n"
+        "s_count 1\n"
+        "# TYPE s histogram\n"
+        "s_bucket{le=\"1\"} 1\n"
+        "s_bucket{le=\"+Inf\"} 1\n"
+        "s_sum 1\n"
+        "s_count 1\n", 0, &opts);
+    TEST_CHECK(status == 0);
+    if (status == 0) {
+        result = cmt_encode_prometheus_create(cmt, CMT_FALSE);
+        TEST_CHECK(strstr(result, "# TYPE s summary\n") != NULL);
+        TEST_CHECK(strstr(result, "# TYPE s histogram\n") != NULL);
+        cfl_sds_destroy(result);
+        cmt_decode_prometheus_destroy(cmt);
+    }
+
+    /* and the other way around */
+    status = cmt_decode_prometheus_create(&cmt,
+        "# TYPE h histogram\n"
+        "h_bucket{le=\"1\"} 1\n"
+        "h_bucket{le=\"+Inf\"} 1\n"
+        "h_sum 1\n"
+        "h_count 1\n"
+        "# TYPE h summary\n"
+        "h{quantile=\"0.5\"} 1\n"
+        "h_sum 1\n"
+        "h_count 1\n", 0, &opts);
+    TEST_CHECK(status == 0);
+    if (status == 0) {
+        result = cmt_encode_prometheus_create(cmt, CMT_FALSE);
+        TEST_CHECK(strstr(result, "# TYPE h summary\n") != NULL);
+        TEST_CHECK(strstr(result, "# TYPE h histogram\n") != NULL);
+        cfl_sds_destroy(result);
+        cmt_decode_prometheus_destroy(cmt);
+    }
+}
+
+void test_summary_missing_quantile()
+{
+    int status;
+    struct cmt *cmt;
+    struct cmt_decode_prometheus_parse_opts opts;
+    cfl_sds_t result;
+
+    memset(&opts, 0, sizeof(opts));
+
+    /* quantile sample without the quantile label */
+    cmt = NULL;
+    status = cmt_decode_prometheus_create(&cmt,
+        "# TYPE foo summary\n"
+        "foo{quantile=\"0.5\",host=\"a\"} 1\n"
+        "foo{host=\"b\"} 2\n"
+        "foo_sum 3\n"
+        "foo_count 2\n", 0, &opts);
+    TEST_CHECK(status == CMT_DECODE_PROMETHEUS_SYNTAX_ERROR);
+
+    /* summary without any label */
+    cmt = NULL;
+    status = cmt_decode_prometheus_create(&cmt,
+        "# TYPE foo summary\n"
+        "foo 1\n"
+        "foo 2\n"
+        "foo_sum 3\n"
+        "foo_count 2\n", 0, &opts);
+    TEST_CHECK(status == CMT_DECODE_PROMETHEUS_SYNTAX_ERROR);
+
+    /* quantiles without sum and count */
+    cmt = NULL;
+    status = cmt_decode_prometheus_create(&cmt,
+        "# TYPE foo summary\n"
+        "foo{quantile=\"0.5\"} 1\n"
+        "foo{quantile=\"0.9\"} 2\n"
+        "foo{quantile=\"0.99\"} 3\n", 0, &opts);
+    TEST_CHECK(status == 0);
+    if (status == 0) {
+        cmt_decode_prometheus_destroy(cmt);
+    }
+
+    /* sum and count only is still valid */
+    cmt = NULL;
+    status = cmt_decode_prometheus_create(&cmt,
+        "# TYPE foo summary\n"
+        "foo_sum 3\n"
+        "foo_count 2\n", 0, &opts);
+    TEST_CHECK(status == 0);
+    if (status == 0) {
+        result = cmt_encode_prometheus_create(cmt, CMT_FALSE);
+        TEST_CHECK(strstr(result, "foo_count 2\n") != NULL);
+        cfl_sds_destroy(result);
+        cmt_decode_prometheus_destroy(cmt);
+    }
+}
+
+void test_lexer_unmatched_input()
+{
+    int i;
+    int status;
+    char errbuf[256];
+    struct cmt *cmt;
+    struct cmt_decode_prometheus_parse_opts opts;
+    const char *inputs[] = {
+        /* unknown metric type */
+        "# TYPE metric_name unknown\n"
+        "metric_name 10\n",
+        "# TYPE metric_name counters\n"
+        "metric_name 10\n",
+        "# TYPE metric_name \xe9\n"
+        "metric_name 10\n",
+        /* unknown escape sequence in a label value */
+        "metric_name{key=\"a\\tb\"} 10\n",
+        /* trailing backslash in a label value */
+        "metric_name{key=\"abc\\",
+        /* bare carriage return in a label value */
+        "metric_name{key=\"a\rb\"} 10\n",
+        /* unknown escape sequence in the docstring */
+        "# HELP metric_name C:\\Temp\n"
+        "metric_name 10\n",
+        /* bare carriage return in the docstring */
+        "# HELP metric_name some\rdocstring\n"
+        "metric_name 10\n",
+        NULL
+    };
+
+    memset(&opts, 0, sizeof(opts));
+    opts.errbuf = errbuf;
+    opts.errbuf_size = sizeof(errbuf);
+
+    for (i = 0; inputs[i] != NULL; i++) {
+        cmt = NULL;
+        status = cmt_decode_prometheus_create(&cmt, inputs[i], 0, &opts);
+        TEST_CHECK(status == CMT_DECODE_PROMETHEUS_SYNTAX_ERROR);
+        TEST_MSG("input %i", i);
+    }
+}
+
+void test_histogram_summary_shorter_instance()
+{
+    int status;
+    struct cmt *cmt;
+    struct cmt_decode_prometheus_parse_opts opts;
+    cfl_sds_t result;
+
+    memset(&opts, 0, sizeof(opts));
+
+    /* the second instance has less buckets and quantiles than the first one */
+    status = cmt_decode_prometheus_create(&cmt,
+        "# TYPE h histogram\n"
+        "h_bucket{code=\"200\",le=\"1\"} 1\n"
+        "h_bucket{code=\"200\",le=\"2\"} 2\n"
+        "h_bucket{code=\"200\",le=\"3\"} 3\n"
+        "h_bucket{code=\"200\",le=\"4\"} 4\n"
+        "h_bucket{code=\"200\",le=\"+Inf\"} 4\n"
+        "h_sum{code=\"200\"} 1\n"
+        "h_count{code=\"200\"} 4\n"
+        "h_bucket{code=\"500\",le=\"1\"} 3\n"
+        "h_bucket{code=\"500\",le=\"+Inf\"} 3\n"
+        "h_sum{code=\"500\"} 2\n"
+        "h_count{code=\"500\"} 3\n"
+        "# TYPE s summary\n"
+        "s{code=\"200\",quantile=\"0.1\"} 1\n"
+        "s{code=\"200\",quantile=\"0.5\"} 2\n"
+        "s{code=\"200\",quantile=\"0.9\"} 3\n"
+        "s_sum{code=\"200\"} 1\n"
+        "s_count{code=\"200\"} 4\n"
+        "s{code=\"500\",quantile=\"0.5\"} 7\n"
+        "s_sum{code=\"500\"} 2\n"
+        "s_count{code=\"500\"} 3\n", 0, &opts);
+    TEST_CHECK(status == 0);
+    if (status == 0) {
+        result = cmt_encode_prometheus_create(cmt, CMT_FALSE);
+        TEST_CHECK(strstr(result, "h_bucket{le=\"1.0\",code=\"500\"} 3\n") != NULL);
+        TEST_CHECK(strstr(result, "h_bucket{le=\"+Inf\",code=\"500\"} 3\n") != NULL);
+        TEST_CHECK(strstr(result, "s{quantile=\"0.5\",code=\"500\"} 7\n") != NULL);
+        TEST_MSG("%s", result);
+        cfl_sds_destroy(result);
+        cmt_decode_prometheus_destroy(cmt);
+    }
+}
+
+void test_duplicate_label_and_help()
+{
+    int status;
+    struct cmt *cmt;
+    struct cmt_decode_prometheus_parse_opts opts;
+    cfl_sds_t result;
+
+    memset(&opts, 0, sizeof(opts));
+
+    /* repeated label names and HELP lines must not leak (checked by ASan) */
+    status = cmt_decode_prometheus_create(&cmt,
+        "# HELP foo first\n"
+        "# HELP foo second\n"
+        "foo{a=\"1\",a=\"2\",a=\"3\"} 1\n", 0, &opts);
+    TEST_CHECK(status == 0);
+    if (status == 0) {
+        result = cmt_encode_prometheus_create(cmt, CMT_FALSE);
+        TEST_CHECK(strstr(result, "# HELP foo second\n") != NULL);
+        TEST_CHECK(strstr(result, "foo{a=\"3\"} 1\n") != NULL);
+        TEST_MSG("%s", result);
+        cfl_sds_destroy(result);
+        cmt_decode_prometheus_destroy(cmt);
+    }
+}
+
 TEST_LIST = {
     {"header_help", test_header_help},
     {"header_type", test_header_type},
     {"header_help_type", test_header_help_type},
     {"header_type_help", test_header_type_help},
+    {"metric_name_ownership", test_metric_name_ownership},
+    {"metric_name_ownership_resets", test_metric_name_ownership_resets},
+    {"metric_name_ownership_error_cleanup", test_metric_name_ownership_error_cleanup},
     {"labels", test_labels},
     {"labels_trailing_comma", test_labels_trailing_comma},
     {"sample", test_sample},
@@ -1712,6 +2025,7 @@ TEST_LIST = {
     {"issue_71", test_issue_71},
     {"histogram", test_histogram},
     {"histogram_labels", test_histogram_labels},
+    {"histogram_missing_le_label", test_histogram_missing_le_label},
     {"summary", test_summary},
     {"null_labels", test_null_labels},
     {"issue_fluent_bit_5541", test_issue_fluent_bit_5541},
@@ -1723,5 +2037,11 @@ TEST_LIST = {
     {"histogram_different_label_count", test_histogram_different_label_count},
     {"issue_fluent_bit_6534", test_issue_fluent_bit_6534},
     {"issue_fluent_bit_9267", test_issue_fluent_bit_9267},
+    {"issue_274", test_issue_274},
+    {"type_redeclared_summary_histogram", test_type_redeclared_summary_histogram},
+    {"summary_missing_quantile", test_summary_missing_quantile},
+    {"lexer_unmatched_input", test_lexer_unmatched_input},
+    {"histogram_summary_shorter_instance", test_histogram_summary_shorter_instance},
+    {"duplicate_label_and_help", test_duplicate_label_and_help},
     { 0 }
 };

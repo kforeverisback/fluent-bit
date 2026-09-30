@@ -74,6 +74,7 @@
 #define HTTP_STREAM_STATUS_PROCESSING          7
 #define HTTP_STREAM_STATUS_CLOSED              8
 #define HTTP_STREAM_STATUS_ERROR               9
+#define HTTP_STREAM_STATUS_RELEASED            10
 
 #define HTTP_WWW_AUTHORIZATION_SCHEME_NONE       0
 #define HTTP_WWW_AUTHORIZATION_SCHEME_BASIC      (((uint64_t) 1) << 0)
@@ -141,6 +142,7 @@ struct flb_http_stream {
 };
 
 struct flb_aws_provider;
+struct flb_connection;
 
 /* HTTP REQUEST */
 
@@ -154,6 +156,8 @@ int flb_http_request_commit(struct flb_http_request *request);
 
 char *flb_http_request_get_header(struct flb_http_request *request,
                                   char *name);
+
+const char *flb_http_request_get_remote_address(struct flb_http_request *request);
 
 int flb_http_request_set_header(struct flb_http_request *request,
                                 char *name, size_t name_length,
@@ -195,6 +199,8 @@ int flb_http_request_set_content_encoding(struct flb_http_request *request,
 int flb_http_request_set_body(struct flb_http_request *request,
                               unsigned char *body, size_t body_length,
                               char *compression_algorithm);
+
+int flb_http_request_normalize(struct flb_http_request *request);
 
 int flb_http_request_set_authorization(struct flb_http_request *request,
                                        int type, ...);

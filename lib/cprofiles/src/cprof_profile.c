@@ -106,6 +106,14 @@ void cprof_profile_destroy(struct cprof_profile *instance)
     size_t                       index;
     struct cprof_link           *link;
 
+    if (instance == NULL) {
+        return;
+    }
+
+    if (cfl_list_entry_is_orphan(&instance->_head) == CFL_FALSE) {
+        cfl_list_del(&instance->_head);
+    }
+
     if (instance->attributes != NULL) {
         cfl_kvlist_destroy(instance->attributes);
     }
@@ -230,6 +238,7 @@ size_t cprof_profile_string_add(struct cprof_profile *profile, char *str, int st
     int alloc_size = 64;
     size_t id;
     size_t new_size;
+    cfl_sds_t *new_table;
 
     if (!str) {
         return -1;
@@ -249,6 +258,9 @@ size_t cprof_profile_string_add(struct cprof_profile *profile, char *str, int st
         /* string_table[0] must always be "" */
         profile->string_table[0] = cfl_sds_create_len("", 0);
         if (!profile->string_table[0]) {
+            free(profile->string_table);
+            profile->string_table = NULL;
+            profile->string_table_size = 0;
             return -1;
         }
         profile->string_table_count = 1;
@@ -257,11 +269,12 @@ size_t cprof_profile_string_add(struct cprof_profile *profile, char *str, int st
     /* check there is enough room for a new entry */
     if (profile->string_table_count >= profile->string_table_size) {
         new_size = profile->string_table_size + alloc_size;
-        profile->string_table = realloc(profile->string_table, new_size * sizeof(cfl_sds_t));
-        if (!profile->string_table) {
+        new_table = realloc(profile->string_table, new_size * sizeof(cfl_sds_t));
+        if (!new_table) {
             return -1;
         }
-        profile->string_table_size = alloc_size;
+        profile->string_table = new_table;
+        profile->string_table_size = new_size;
     }
 
     id = profile->string_table_count;

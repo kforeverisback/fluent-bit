@@ -1,8 +1,10 @@
 set(UNIT_TESTS_FILES
+  protobuf.c
+  variant_depth.c
   profile.c
   msgpack_transcoder.c
   opentelemetry_transcoder.c
-  text_transcoder.c
+  text_encoder.c
   )
 
 set(CPROF_TESTS_DATA_PATH "${CMAKE_CURRENT_SOURCE_DIR}/data")

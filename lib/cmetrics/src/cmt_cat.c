@@ -24,7 +24,9 @@
 #include <cmetrics/cmt_gauge.h>
 #include <cmetrics/cmt_untyped.h>
 #include <cmetrics/cmt_histogram.h>
+#include <cmetrics/cmt_exp_histogram.h>
 #include <cmetrics/cmt_summary.h>
+#include <cmetrics/cmt_atomic.h>
 
 int cmt_cat_copy_label_keys(struct cmt_map *map, char **out)
 {
@@ -96,30 +98,75 @@ static int copy_label_values(struct cmt_metric *metric, char **out)
     return i;
 }
 
-static inline int cat_histogram_values(struct cmt_metric *metric_dst, struct cmt_histogram *histogram,
-                                       struct cmt_metric *metric_src)
+static inline int cat_histogram_values(struct cmt_metric *metric_dst, struct cmt_histogram *histogram_src,
+                                       struct cmt_metric *metric_src, struct cmt_histogram *histogram_dst)
 {
     int i;
+    int result;
+    uint64_t old_value;
+    uint64_t new_value;
+    size_t bucket_count_src;
+    size_t bucket_count_dst;
 
+    /* Validate source histogram buckets exist */
+    if (!metric_src->hist_buckets) {
+        /* Source has no bucket data, nothing to concatenate */
+        return 0;
+    }
+
+    if (histogram_src->buckets == NULL || histogram_dst->buckets == NULL) {
+        return -1;
+    }
+
+    bucket_count_src = histogram_src->buckets->count;
+    bucket_count_dst = histogram_dst->buckets->count;
+
+    /* Validate that source and destination have matching bucket structures */
+    if (bucket_count_src != bucket_count_dst) {
+        /* Histogram bucket structures don't match - cannot concatenate */
+        return -1;
+    }
+
+    /* Allocate destination buckets if needed */
     if (!metric_dst->hist_buckets) {
-        metric_dst->hist_buckets = calloc(1, sizeof(uint64_t) * (histogram->buckets->count + 1));
+        metric_dst->hist_buckets = calloc(1, sizeof(uint64_t) * (bucket_count_dst + 1));
         if (!metric_dst->hist_buckets) {
             return -1;
         }
     }
 
-    for (i = 0; i < histogram->buckets->count; i++) {
-        /* histogram buckets are always integers, no need to convert them */
-        metric_dst->hist_buckets[i] += metric_src->hist_buckets[i];
+    /* Concatenate bucket values including +Inf bucket at index bucket_count_dst */
+    for (i = 0; i <= bucket_count_dst; i++) {
+        do {
+            old_value = cmt_atomic_load(&metric_dst->hist_buckets[i]);
+            new_value = old_value + cmt_atomic_load(&metric_src->hist_buckets[i]);
+            result = cmt_atomic_compare_exchange(&metric_dst->hist_buckets[i],
+                                                 old_value, new_value);
+        }
+        while (result == 0);
     }
 
     /* histogram count */
-    metric_dst->hist_count = cmt_math_sum_native_uint64_as_d64(metric_dst->hist_count,
-                                                               metric_src->hist_count);
+    do {
+        old_value = cmt_atomic_load(&metric_dst->hist_count);
+        new_value = cmt_math_sum_native_uint64_as_d64(
+                        old_value,
+                        cmt_atomic_load(&metric_src->hist_count));
+        result = cmt_atomic_compare_exchange(&metric_dst->hist_count,
+                                             old_value, new_value);
+    }
+    while (result == 0);
 
     /* histoggram sum */
-    metric_dst->hist_sum = cmt_math_sum_native_uint64_as_d64(metric_dst->hist_sum,
-                                                             metric_src->hist_sum);
+    do {
+        old_value = cmt_atomic_load(&metric_dst->hist_sum);
+        new_value = cmt_math_sum_native_uint64_as_d64(
+                        old_value,
+                        cmt_atomic_load(&metric_src->hist_sum));
+        result = cmt_atomic_compare_exchange(&metric_dst->hist_sum,
+                                             old_value, new_value);
+    }
+    while (result == 0);
 
     return 0;
 }
@@ -141,31 +188,329 @@ static inline int cat_summary_values(struct cmt_metric *metric_dst, struct cmt_s
     }
 
     for (i = 0; i < summary->quantiles_count; i++) {
-        /* summary quantiles are always integers, no need to convert them */
-        metric_dst->sum_quantiles[i] = metric_src->sum_quantiles[i];
+        cmt_atomic_store(&metric_dst->sum_quantiles[i],
+                         cmt_atomic_load(&metric_src->sum_quantiles[i]));
     }
 
     metric_dst->sum_quantiles_count = metric_src->sum_quantiles_count;
-    metric_dst->sum_quantiles_set = metric_src->sum_quantiles_set;
+    cmt_atomic_store(&metric_dst->sum_quantiles_set, cmt_atomic_load(&metric_src->sum_quantiles_set));
 
-    metric_dst->sum_count = metric_src->sum_count;
-    metric_dst->sum_sum = metric_src->sum_sum;
+    cmt_atomic_store(&metric_dst->sum_count, cmt_atomic_load(&metric_src->sum_count));
+    cmt_atomic_store(&metric_dst->sum_sum, cmt_atomic_load(&metric_src->sum_sum));
 
     return 0;
+}
+
+/* build the merge of the src buckets into the dst buckets in a new array
+ * without modifying either side. On success *out_buckets is NULL when src
+ * has no buckets, meaning dst stays as is.
+ */
+static int merge_exp_hist_buckets(uint64_t *dst_buckets, int32_t dst_offset,
+                                  size_t dst_count,
+                                  uint64_t *src_buckets, int32_t src_offset,
+                                  size_t src_count,
+                                  uint64_t **out_buckets, int32_t *out_offset,
+                                  size_t *out_count)
+{
+    int64_t dst_start;
+    int64_t dst_end;
+    int64_t src_start;
+    int64_t src_end;
+    int64_t merged_start;
+    int64_t merged_end;
+    size_t index;
+    size_t merged_count;
+    uint64_t *merged_buckets;
+
+    *out_buckets = NULL;
+    *out_offset = 0;
+    *out_count = 0;
+
+    if (src_count == 0) {
+        return 0;
+    }
+
+    if (dst_count == 0) {
+        merged_buckets = calloc(src_count, sizeof(uint64_t));
+        if (merged_buckets == NULL) {
+            return -1;
+        }
+
+        memcpy(merged_buckets, src_buckets, sizeof(uint64_t) * src_count);
+
+        *out_buckets = merged_buckets;
+        *out_offset = src_offset;
+        *out_count = src_count;
+
+        return 0;
+    }
+
+    dst_start = dst_offset;
+    dst_end = dst_start + dst_count;
+    src_start = src_offset;
+    src_end = src_start + src_count;
+
+    merged_start = dst_start < src_start ? dst_start : src_start;
+    merged_end = dst_end > src_end ? dst_end : src_end;
+    merged_count = (size_t) (merged_end - merged_start);
+
+    /* the range comes from the sample offsets, not from the number
+     * of buckets present, so it must be bounded
+     */
+    if (merged_count > CMT_EXP_HISTOGRAM_MAX_BUCKETS) {
+        return -1;
+    }
+
+    merged_buckets = calloc(merged_count, sizeof(uint64_t));
+    if (merged_buckets == NULL) {
+        return -1;
+    }
+
+    for (index = 0; index < dst_count; index++) {
+        merged_buckets[(size_t) (dst_start + index - merged_start)] +=
+            dst_buckets[index];
+    }
+
+    for (index = 0; index < src_count; index++) {
+        merged_buckets[(size_t) (src_start + index - merged_start)] +=
+            src_buckets[index];
+    }
+
+    *out_buckets = merged_buckets;
+    *out_offset = (int32_t) merged_start;
+    *out_count = merged_count;
+
+    return 0;
+}
+
+static inline int cat_exp_histogram_values(struct cmt_metric *metric_dst,
+                                           struct cmt_metric *metric_src)
+{
+    int result;
+    struct cmt_metric *first_lock_target;
+    struct cmt_metric *second_lock_target;
+    int32_t positive_offset;
+    int32_t negative_offset;
+    size_t positive_count;
+    size_t negative_count;
+    uint64_t old_value;
+    uint64_t new_value;
+    uint64_t *positive_buckets;
+    uint64_t *negative_buckets;
+
+    result = -1;
+    positive_buckets = NULL;
+    negative_buckets = NULL;
+    first_lock_target = metric_dst;
+    second_lock_target = metric_src;
+
+    if (first_lock_target > second_lock_target) {
+        first_lock_target = metric_src;
+        second_lock_target = metric_dst;
+    }
+
+    cmt_metric_exp_hist_lock(first_lock_target);
+
+    if (second_lock_target != first_lock_target) {
+        cmt_metric_exp_hist_lock(second_lock_target);
+    }
+
+    if (metric_dst->exp_hist_positive_count > 0 &&
+        metric_dst->exp_hist_positive_buckets == NULL) {
+        goto cleanup;
+    }
+
+    if (metric_dst->exp_hist_negative_count > 0 &&
+        metric_dst->exp_hist_negative_buckets == NULL) {
+        goto cleanup;
+    }
+
+    if (metric_src->exp_hist_positive_count > 0 &&
+        metric_src->exp_hist_positive_buckets == NULL) {
+        goto cleanup;
+    }
+
+    if (metric_src->exp_hist_negative_count > 0 &&
+        metric_src->exp_hist_negative_buckets == NULL) {
+        goto cleanup;
+    }
+
+    if (metric_dst->exp_hist_positive_buckets == NULL &&
+        metric_dst->exp_hist_negative_buckets == NULL &&
+        metric_dst->exp_hist_positive_count == 0 &&
+        metric_dst->exp_hist_negative_count == 0 &&
+        cmt_atomic_load(&metric_dst->exp_hist_count) == 0 &&
+        metric_dst->exp_hist_zero_count == 0 &&
+        cmt_atomic_load(&metric_dst->exp_hist_sum) == 0 &&
+        metric_dst->exp_hist_scale == 0 &&
+        metric_dst->exp_hist_positive_offset == 0 &&
+        metric_dst->exp_hist_negative_offset == 0 &&
+        metric_dst->exp_hist_zero_threshold == 0.0) {
+        if (metric_src->exp_hist_positive_count > 0) {
+            metric_dst->exp_hist_positive_buckets = calloc(metric_src->exp_hist_positive_count,
+                                                           sizeof(uint64_t));
+            if (metric_dst->exp_hist_positive_buckets == NULL) {
+                goto cleanup;
+            }
+
+            memcpy(metric_dst->exp_hist_positive_buckets,
+                   metric_src->exp_hist_positive_buckets,
+                   sizeof(uint64_t) * metric_src->exp_hist_positive_count);
+        }
+
+        if (metric_src->exp_hist_negative_count > 0) {
+            metric_dst->exp_hist_negative_buckets = calloc(metric_src->exp_hist_negative_count,
+                                                           sizeof(uint64_t));
+            if (metric_dst->exp_hist_negative_buckets == NULL) {
+                free(metric_dst->exp_hist_positive_buckets);
+                metric_dst->exp_hist_positive_buckets = NULL;
+
+                goto cleanup;
+            }
+
+            memcpy(metric_dst->exp_hist_negative_buckets,
+                   metric_src->exp_hist_negative_buckets,
+                   sizeof(uint64_t) * metric_src->exp_hist_negative_count);
+        }
+
+        metric_dst->exp_hist_scale = metric_src->exp_hist_scale;
+        metric_dst->exp_hist_zero_count = metric_src->exp_hist_zero_count;
+        metric_dst->exp_hist_zero_threshold = metric_src->exp_hist_zero_threshold;
+        metric_dst->exp_hist_positive_offset = metric_src->exp_hist_positive_offset;
+        metric_dst->exp_hist_positive_count = metric_src->exp_hist_positive_count;
+        metric_dst->exp_hist_negative_offset = metric_src->exp_hist_negative_offset;
+        metric_dst->exp_hist_negative_count = metric_src->exp_hist_negative_count;
+        cmt_atomic_store(&metric_dst->exp_hist_count,
+                         cmt_atomic_load(&metric_src->exp_hist_count));
+        cmt_atomic_store(&metric_dst->exp_hist_sum_set,
+                         cmt_atomic_load(&metric_src->exp_hist_sum_set));
+        cmt_atomic_store(&metric_dst->exp_hist_sum,
+                         cmt_atomic_load(&metric_src->exp_hist_sum));
+
+        result = 0;
+        goto cleanup;
+    }
+
+    if (metric_dst->exp_hist_scale != metric_src->exp_hist_scale ||
+        metric_dst->exp_hist_zero_threshold != metric_src->exp_hist_zero_threshold) {
+        goto cleanup;
+    }
+
+    /* stage both sides before touching the destination so a failure on
+     * either side leaves it unchanged
+     */
+    if (merge_exp_hist_buckets(metric_dst->exp_hist_positive_buckets,
+                               metric_dst->exp_hist_positive_offset,
+                               metric_dst->exp_hist_positive_count,
+                               metric_src->exp_hist_positive_buckets,
+                               metric_src->exp_hist_positive_offset,
+                               metric_src->exp_hist_positive_count,
+                               &positive_buckets, &positive_offset,
+                               &positive_count) != 0) {
+        goto cleanup;
+    }
+
+    if (merge_exp_hist_buckets(metric_dst->exp_hist_negative_buckets,
+                               metric_dst->exp_hist_negative_offset,
+                               metric_dst->exp_hist_negative_count,
+                               metric_src->exp_hist_negative_buckets,
+                               metric_src->exp_hist_negative_offset,
+                               metric_src->exp_hist_negative_count,
+                               &negative_buckets, &negative_offset,
+                               &negative_count) != 0) {
+        free(positive_buckets);
+        goto cleanup;
+    }
+
+    if (positive_buckets != NULL) {
+        free(metric_dst->exp_hist_positive_buckets);
+        metric_dst->exp_hist_positive_buckets = positive_buckets;
+        metric_dst->exp_hist_positive_offset = positive_offset;
+        metric_dst->exp_hist_positive_count = positive_count;
+    }
+
+    if (negative_buckets != NULL) {
+        free(metric_dst->exp_hist_negative_buckets);
+        metric_dst->exp_hist_negative_buckets = negative_buckets;
+        metric_dst->exp_hist_negative_offset = negative_offset;
+        metric_dst->exp_hist_negative_count = negative_count;
+    }
+
+    metric_dst->exp_hist_zero_count += metric_src->exp_hist_zero_count;
+
+    do {
+        old_value = cmt_atomic_load(&metric_dst->exp_hist_count);
+        new_value = old_value + cmt_atomic_load(&metric_src->exp_hist_count);
+        result = cmt_atomic_compare_exchange(&metric_dst->exp_hist_count,
+                                             old_value, new_value);
+    }
+    while (result == 0);
+
+    if (cmt_atomic_load(&metric_dst->exp_hist_sum_set) &&
+        cmt_atomic_load(&metric_src->exp_hist_sum_set)) {
+        cmt_atomic_store(&metric_dst->exp_hist_sum,
+                         cmt_math_d64_to_uint64(
+                             cmt_math_uint64_to_d64(
+                                 cmt_atomic_load(&metric_dst->exp_hist_sum)) +
+                             cmt_math_uint64_to_d64(
+                                 cmt_atomic_load(&metric_src->exp_hist_sum))));
+    }
+    else if (cmt_atomic_load(&metric_src->exp_hist_sum_set)) {
+        cmt_atomic_store(&metric_dst->exp_hist_sum_set, CMT_TRUE);
+        cmt_atomic_store(&metric_dst->exp_hist_sum,
+                         cmt_atomic_load(&metric_src->exp_hist_sum));
+    }
+
+    result = 0;
+
+cleanup:
+    if (second_lock_target != first_lock_target) {
+        cmt_metric_exp_hist_unlock(second_lock_target);
+    }
+    cmt_metric_exp_hist_unlock(first_lock_target);
+
+    return result;
+}
+
+static inline void cat_scalar_value(struct cmt_metric *metric_dst,
+                                    struct cmt_metric *metric_src)
+{
+    uint64_t ts;
+    double val;
+
+    ts = cmt_metric_get_timestamp(metric_src);
+
+    if (cmt_metric_get_value_type(metric_src) == CMT_METRIC_VALUE_INT64) {
+        cmt_metric_set_int64(metric_dst, ts, cmt_metric_get_int64_value(metric_src));
+    }
+    else if (cmt_metric_get_value_type(metric_src) == CMT_METRIC_VALUE_UINT64) {
+        cmt_metric_set_uint64(metric_dst, ts, cmt_metric_get_uint64_value(metric_src));
+    }
+    else {
+        val = cmt_metric_get_value(metric_src);
+        cmt_metric_set_double(metric_dst, ts, val);
+    }
+
+    if (cmt_metric_has_start_timestamp(metric_src)) {
+        cmt_metric_set_start_timestamp(metric_dst,
+                                       cmt_metric_get_start_timestamp(metric_src));
+    }
+    else {
+        cmt_metric_unset_start_timestamp(metric_dst);
+    }
 }
 
 int cmt_cat_copy_map(struct cmt_opts *opts, struct cmt_map *dst, struct cmt_map *src)
 {
     int c;
     int ret;
-    uint64_t ts;
-    double val;
     char **labels = NULL;
     struct cfl_list *head;
     struct cmt_metric *metric_dst;
     struct cmt_metric *metric_src;
     struct cmt_summary *summary;
-    struct cmt_histogram *histogram;
+    struct cmt_histogram *histogram_src;
+    struct cmt_histogram *histogram_dst;
 
     /* Handle static metric (no labels case) */
     if (src->metric_static_set) {
@@ -176,8 +521,9 @@ int cmt_cat_copy_map(struct cmt_opts *opts, struct cmt_map *dst, struct cmt_map 
         metric_src = &src->metric;
 
         if (src->type == CMT_HISTOGRAM) {
-            histogram = (struct cmt_histogram *) src->parent;
-            ret = cat_histogram_values(metric_dst, histogram, metric_src);
+            histogram_src = (struct cmt_histogram *) src->parent;
+            histogram_dst = (struct cmt_histogram *) dst->parent;
+            ret = cat_histogram_values(metric_dst, histogram_src, metric_src, histogram_dst);
             if (ret == -1) {
                 return -1;
             }
@@ -189,11 +535,14 @@ int cmt_cat_copy_map(struct cmt_opts *opts, struct cmt_map *dst, struct cmt_map 
                 return -1;
             }
         }
+        else if (src->type == CMT_EXP_HISTOGRAM) {
+            ret = cat_exp_histogram_values(metric_dst, metric_src);
+            if (ret == -1) {
+                return -1;
+            }
+        }
 
-        ts  = cmt_metric_get_timestamp(metric_src);
-        val = cmt_metric_get_value(metric_src);
-
-        cmt_metric_set(metric_dst, ts, val);
+        cat_scalar_value(metric_dst, metric_src);
     }
 
     /* Process map dynamic metrics */
@@ -214,8 +563,9 @@ int cmt_cat_copy_map(struct cmt_opts *opts, struct cmt_map *dst, struct cmt_map 
         }
 
         if (src->type == CMT_HISTOGRAM) {
-            histogram = (struct cmt_histogram *) src->parent;
-            ret = cat_histogram_values(metric_dst, histogram, metric_src);
+            histogram_src = (struct cmt_histogram *) src->parent;
+            histogram_dst = (struct cmt_histogram *) dst->parent;
+            ret = cat_histogram_values(metric_dst, histogram_src, metric_src, histogram_dst);
             if (ret == -1) {
                 return -1;
             }
@@ -227,11 +577,14 @@ int cmt_cat_copy_map(struct cmt_opts *opts, struct cmt_map *dst, struct cmt_map 
                 return -1;
             }
         }
+        else if (src->type == CMT_EXP_HISTOGRAM) {
+            ret = cat_exp_histogram_values(metric_dst, metric_src);
+            if (ret == -1) {
+                return -1;
+            }
+        }
 
-        ts  = cmt_metric_get_timestamp(metric_src);
-        val = cmt_metric_get_value(metric_src);
-
-        cmt_metric_set(metric_dst, ts, val);
+        cat_scalar_value(metric_dst, metric_src);
     }
 
     return 0;
@@ -318,6 +671,65 @@ static struct cmt_histogram *histogram_lookup(struct cmt *cmt, struct cmt_opts *
     }
 
     return NULL;
+}
+
+static struct cmt_exp_histogram *exp_histogram_lookup(struct cmt *cmt, struct cmt_opts *opts)
+{
+    struct cmt_exp_histogram *exp_histogram;
+    struct cfl_list *head;
+
+    cfl_list_foreach(head, &cmt->exp_histograms) {
+        exp_histogram = cfl_list_entry(head, struct cmt_exp_histogram, _head);
+        if (cmt_opts_compare(&exp_histogram->opts, opts) == 0) {
+            return exp_histogram;
+        }
+    }
+
+    return NULL;
+}
+
+static struct cmt_summary *summary_lookup(struct cmt *cmt, struct cmt_opts *opts)
+{
+    struct cmt_summary *summary;
+    struct cfl_list *head;
+
+    cfl_list_foreach(head, &cmt->summaries) {
+        summary = cfl_list_entry(head, struct cmt_summary, _head);
+        if (cmt_opts_compare(&summary->opts, opts) == 0) {
+            return summary;
+        }
+    }
+
+    return NULL;
+}
+
+static int summary_label_keys_match(struct cmt_map *left,
+                                    struct cmt_map *right)
+{
+    struct cfl_list *left_head;
+    struct cfl_list *right_head;
+    struct cmt_map_label *left_label;
+    struct cmt_map_label *right_label;
+
+    left_head = left->label_keys.next;
+    right_head = right->label_keys.next;
+
+    while (left_head != &left->label_keys &&
+           right_head != &right->label_keys) {
+        left_label = cfl_list_entry(left_head, struct cmt_map_label, _head);
+        right_label = cfl_list_entry(right_head, struct cmt_map_label, _head);
+
+        if (left_label->name == NULL || right_label->name == NULL ||
+            strcmp(left_label->name, right_label->name) != 0) {
+            return CMT_FALSE;
+        }
+
+        left_head = left_head->next;
+        right_head = right_head->next;
+    }
+
+    return left_head == &left->label_keys &&
+           right_head == &right->label_keys;
 }
 
 int cmt_cat_counter(struct cmt *cmt, struct cmt_counter *counter,
@@ -475,6 +887,11 @@ int cmt_cat_histogram(struct cmt *cmt, struct cmt_histogram *histogram,
     map = histogram->map;
     opts = map->opts;
 
+    /* a decoded histogram may come without a bucket layout */
+    if (histogram->buckets == NULL) {
+        return -1;
+    }
+
     ret = cmt_cat_copy_label_keys(map, (char **) &labels);
     if (ret == -1) {
         return -1;
@@ -518,48 +935,65 @@ int cmt_cat_histogram(struct cmt *cmt, struct cmt_histogram *histogram,
 int cmt_cat_summary(struct cmt *cmt, struct cmt_summary *summary,
                     struct cmt_map *filtered_map)
 {
-    int i;
+    size_t i;
     int ret;
     char **labels = NULL;
     struct cmt_map *map;
     struct cmt_opts *opts;
     struct cmt_summary *sum;
     double *quantiles;
-    uint64_t timestamp;
-    double summary_sum;
 
     map = summary->map;
     opts = map->opts;
-    timestamp = cmt_metric_get_timestamp(&map->metric);
-
     ret = cmt_cat_copy_label_keys(map, (char **) &labels);
     if (ret == -1) {
         return -1;
     }
 
-    quantiles = calloc(1, sizeof(double) * summary->quantiles_count);
-    for (i = 0; i < summary->quantiles_count; i++) {
-        quantiles[i] = summary->quantiles[i];
+    sum = summary_lookup(cmt, opts);
+    if (sum != NULL) {
+        if (!summary_label_keys_match(sum->map, map)) {
+            free(labels);
+            return -1;
+        }
+
+        if (sum->quantiles_count != summary->quantiles_count) {
+            free(labels);
+            return -1;
+        }
+
+        for (i = 0; i < summary->quantiles_count; i++) {
+            if (sum->quantiles[i] != summary->quantiles[i]) {
+                free(labels);
+                return -1;
+            }
+        }
+    }
+    else {
+        quantiles = NULL;
+        if (summary->quantiles_count > 0) {
+            quantiles = calloc(summary->quantiles_count, sizeof(double));
+            if (quantiles == NULL) {
+                free(labels);
+                return -1;
+            }
+            memcpy(quantiles, summary->quantiles,
+                   summary->quantiles_count * sizeof(double));
+        }
+
+        sum = cmt_summary_create(cmt,
+                                 opts->ns, opts->subsystem,
+                                 opts->name, opts->description,
+                                 summary->quantiles_count,
+                                 quantiles,
+                                 map->label_count, labels);
+        free(quantiles);
     }
 
-    /* create summary */
-    sum = cmt_summary_create(cmt,
-                             opts->ns, opts->subsystem,
-                             opts->name, opts->description,
-                             summary->quantiles_count,
-                             quantiles,
-                             map->label_count, labels);
+    free(labels);
     if (!sum) {
-        free(labels);
-        free(quantiles);
         return -1;
     }
-
-    summary_sum = cmt_summary_get_sum_value(&summary->map->metric);
-
-    cmt_summary_set_default(sum, timestamp, quantiles, summary_sum, summary->quantiles_count, map->label_count, labels);
-    free(labels);
-    free(quantiles);
 
     if (filtered_map != NULL) {
         ret = cmt_cat_copy_map(&sum->opts, sum->map, filtered_map);
@@ -577,6 +1011,52 @@ int cmt_cat_summary(struct cmt *cmt, struct cmt_summary *summary,
     return 0;
 }
 
+int cmt_cat_exp_histogram(struct cmt *cmt, struct cmt_exp_histogram *exp_histogram,
+                          struct cmt_map *filtered_map)
+{
+    int ret;
+    char **labels = NULL;
+    struct cmt_map *map;
+    struct cmt_opts *opts;
+    struct cmt_exp_histogram *eh;
+
+    map = exp_histogram->map;
+    opts = map->opts;
+
+    ret = cmt_cat_copy_label_keys(map, (char **) &labels);
+    if (ret == -1) {
+        return -1;
+    }
+
+    eh = exp_histogram_lookup(cmt, opts);
+    if (!eh) {
+        eh = cmt_exp_histogram_create(cmt,
+                                      opts->ns, opts->subsystem,
+                                      opts->name, opts->description,
+                                      map->label_count, labels);
+    }
+
+    free(labels);
+    if (!eh) {
+        return -1;
+    }
+
+    eh->aggregation_type = exp_histogram->aggregation_type;
+
+    if (filtered_map != NULL) {
+        ret = cmt_cat_copy_map(&eh->opts, eh->map, filtered_map);
+    }
+    else {
+        ret = cmt_cat_copy_map(&eh->opts, eh->map, map);
+    }
+
+    if (ret == -1) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static int append_context(struct cmt *dst, struct cmt *src)
 {
     int ret;
@@ -585,6 +1065,7 @@ static int append_context(struct cmt *dst, struct cmt *src)
     struct cmt_gauge *gauge;
     struct cmt_untyped *untyped;
     struct cmt_histogram *histogram;
+    struct cmt_exp_histogram *exp_histogram;
     struct cmt_summary *summary;
 
      /* Counters */
@@ -623,6 +1104,15 @@ static int append_context(struct cmt *dst, struct cmt *src)
         }
     }
 
+    /* Exponential Histogram */
+    cfl_list_foreach(head, &src->exp_histograms) {
+        exp_histogram = cfl_list_entry(head, struct cmt_exp_histogram, _head);
+        ret = cmt_cat_exp_histogram(dst, exp_histogram, NULL);
+        if (ret == -1) {
+            return -1;
+        }
+    }
+
     /* Summary */
     cfl_list_foreach(head, &src->summaries) {
         summary = cfl_list_entry(head, struct cmt_summary, _head);
@@ -635,8 +1125,136 @@ static int append_context(struct cmt *dst, struct cmt *src)
     return 0;
 }
 
+static struct cmt_label *find_static_label(struct cmt_labels *labels, char *key)
+{
+    struct cfl_list *head;
+    struct cmt_label *label;
+
+    cfl_list_foreach(head, &labels->list) {
+        label = cfl_list_entry(head, struct cmt_label, _head);
+        if (strcmp(label->key, key) == 0) {
+            return label;
+        }
+    }
+
+    return NULL;
+}
+
+static int map_has_label_key(struct cmt_map *map, char *key)
+{
+    struct cfl_list *head;
+    struct cmt_map_label *label;
+
+    cfl_list_foreach(head, &map->label_keys) {
+        label = cfl_list_entry(head, struct cmt_map_label, _head);
+        if (strcmp(label->name, key) == 0) {
+            return CMT_TRUE;
+        }
+    }
+
+    return CMT_FALSE;
+}
+
+static int context_has_label_key(struct cmt *cmt, char *key)
+{
+    struct cfl_list *head;
+    struct cmt_counter *counter;
+    struct cmt_gauge *gauge;
+    struct cmt_untyped *untyped;
+    struct cmt_histogram *histogram;
+    struct cmt_exp_histogram *exp_histogram;
+    struct cmt_summary *summary;
+
+    cfl_list_foreach(head, &cmt->counters) {
+        counter = cfl_list_entry(head, struct cmt_counter, _head);
+        if (map_has_label_key(counter->map, key)) {
+            return CMT_TRUE;
+        }
+    }
+
+    cfl_list_foreach(head, &cmt->gauges) {
+        gauge = cfl_list_entry(head, struct cmt_gauge, _head);
+        if (map_has_label_key(gauge->map, key)) {
+            return CMT_TRUE;
+        }
+    }
+
+    cfl_list_foreach(head, &cmt->untypeds) {
+        untyped = cfl_list_entry(head, struct cmt_untyped, _head);
+        if (map_has_label_key(untyped->map, key)) {
+            return CMT_TRUE;
+        }
+    }
+
+    cfl_list_foreach(head, &cmt->histograms) {
+        histogram = cfl_list_entry(head, struct cmt_histogram, _head);
+        if (map_has_label_key(histogram->map, key)) {
+            return CMT_TRUE;
+        }
+    }
+
+    cfl_list_foreach(head, &cmt->exp_histograms) {
+        exp_histogram = cfl_list_entry(head, struct cmt_exp_histogram, _head);
+        if (map_has_label_key(exp_histogram->map, key)) {
+            return CMT_TRUE;
+        }
+    }
+
+    cfl_list_foreach(head, &cmt->summaries) {
+        summary = cfl_list_entry(head, struct cmt_summary, _head);
+        if (map_has_label_key(summary->map, key)) {
+            return CMT_TRUE;
+        }
+    }
+
+    return CMT_FALSE;
+}
+
+static int copy_static_labels(struct cmt *dst, struct cmt *src,
+                              struct cmt_labels *pending)
+{
+    struct cfl_list *head;
+    struct cmt_label *label;
+    struct cmt_label *existing;
+
+    cfl_list_foreach(head, &src->static_labels->list) {
+        label = cfl_list_entry(head, struct cmt_label, _head);
+        /* Reject source schema collisions even when dst has the same label. */
+        if (context_has_label_key(src, label->key)) {
+            return -1;
+        }
+        existing = find_static_label(dst->static_labels, label->key);
+        if (existing == NULL) {
+            existing = find_static_label(pending, label->key);
+        }
+
+        if (existing != NULL) {
+            if (strcmp(existing->val, label->val) != 0) {
+                return -1;
+            }
+        }
+        else {
+            /* Static labels apply to every destination metric, including
+             * schemas that have no samples yet. Reject before appending. */
+            if (context_has_label_key(dst, label->key)) {
+                return -1;
+            }
+            if (cmt_labels_add_kv(pending, label->key, label->val) != 0) {
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 int cmt_cat(struct cmt *dst, struct cmt *src)
 {
+    int ret;
+    struct cmt_labels *pending;
+    struct cfl_list *head;
+    struct cfl_list *tmp;
+
     if (!dst) {
         return -1;
     }
@@ -645,5 +1263,29 @@ int cmt_cat(struct cmt *dst, struct cmt *src)
         return -1;
     }
 
-    return append_context(dst, src);
+    if (cfl_list_size(&src->static_labels->list) == 0) {
+        return append_context(dst, src);
+    }
+
+    /* Resolve label conflicts and allocation failures before copying metrics. */
+    pending = cmt_labels_create();
+    if (pending == NULL) {
+        return -1;
+    }
+    ret = copy_static_labels(dst, src, pending);
+    if (ret != 0) {
+        cmt_labels_destroy(pending);
+        return -1;
+    }
+
+    ret = append_context(dst, src);
+    if (ret == 0) {
+        cfl_list_foreach_safe(head, tmp, &pending->list) {
+            cfl_list_del(head);
+            cfl_list_add(head, &dst->static_labels->list);
+        }
+    }
+    cmt_labels_destroy(pending);
+
+    return ret;
 }

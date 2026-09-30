@@ -332,6 +332,7 @@ static inline int _mk_event_timeout_create(struct mk_event_ctx *ctx,
         mk_mem_free(timer);
         return -1;
     }
+    pthread_detach(tid);
 
     return fd[0];
 }
@@ -398,14 +399,11 @@ static inline int _mk_event_channel_destroy(struct mk_event_ctx *ctx,
     }
 
     ret = _mk_event_del(ctx, event);
-    if (ret != 0) {
-        return ret;
-    }
 
     close(r_fd);
     close(w_fd);
 
-    return 0;
+    return ret;
 }
 
 static inline int _mk_event_inject(struct mk_event_loop *loop,

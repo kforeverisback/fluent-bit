@@ -74,6 +74,43 @@ static inline size_t http2_lower_value(size_t left_value, size_t right_value)
     return right_value;
 }
 
+static int http2_request_body_limit_exceeded(struct flb_http_stream *stream,
+                                             size_t append_length)
+{
+    size_t                           current_length;
+    struct flb_http_server_session  *parent_session;
+    struct flb_http_server          *server;
+    size_t                           maximum_size;
+
+    parent_session = (struct flb_http_server_session *) stream->parent;
+
+    if (parent_session == NULL) {
+        return FLB_TRUE;
+    }
+
+    server = parent_session->parent;
+
+    if (server == NULL) {
+        return FLB_TRUE;
+    }
+
+    maximum_size = flb_http_server_get_buffer_max_size(server);
+
+    if (stream->request.body == NULL) {
+        current_length = 0;
+    }
+    else {
+        current_length = cfl_sds_len(stream->request.body);
+    }
+
+    if (append_length > maximum_size ||
+        current_length > maximum_size - append_length) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
 /* RESPONSE */
 
 struct flb_http_response *flb_http2_response_begin(
@@ -138,6 +175,7 @@ int flb_http2_response_commit(struct flb_http_response *response)
     struct flb_http2_server_session *session;
     struct flb_http_stream          *stream;
     int                              result;
+    char                            *header_value;
 
     parent_session = (struct flb_http_server_session *) response->stream->parent;
 
@@ -177,6 +215,24 @@ int flb_http2_response_commit(struct flb_http_response *response)
 
     header_index = 1;
 
+    header_value = flb_http_response_get_header(response, "server");
+    if (header_value != NULL) {
+        headers[header_index].name = (uint8_t *) "server";
+        headers[header_index].namelen = strlen("server");
+        headers[header_index].value = (uint8_t *) header_value;
+        headers[header_index].valuelen = strlen(header_value);
+        header_index++;
+    }
+
+    header_value = flb_http_response_get_header(response, "x-http-engine");
+    if (header_value != NULL) {
+        headers[header_index].name = (uint8_t *) "x-http-engine";
+        headers[header_index].namelen = strlen("x-http-engine");
+        headers[header_index].value = (uint8_t *) header_value;
+        headers[header_index].valuelen = strlen(header_value);
+        header_index++;
+    }
+
     mk_list_foreach(header_iterator, &response->headers->entries) {
         header_entry = mk_list_entry(header_iterator, 
                                      struct flb_hash_table_entry, 
@@ -186,6 +242,17 @@ int flb_http2_response_commit(struct flb_http_response *response)
             flb_free(headers);
 
             return -4;
+        }
+
+        if ((header_entry->key_len == strlen("server") &&
+             strncasecmp((const char *) header_entry->key,
+                         "server",
+                         header_entry->key_len) == 0) ||
+            (header_entry->key_len == strlen("x-http-engine") &&
+             strncasecmp((const char *) header_entry->key,
+                         "x-http-engine",
+                         header_entry->key_len) == 0)) {
+            continue;
         }
 
         headers[header_index].name = (uint8_t *) header_entry->key;
@@ -281,9 +348,44 @@ int flb_http2_response_commit(struct flb_http_response *response)
         return -8;
     }
 
-    stream->status = HTTP_STREAM_STATUS_RECEIVING_HEADERS;
-
     return 0;
+}
+
+/* STREAM */
+
+/*
+ * Called once the request callback is done with a dispatched stream. The
+ * response body is pulled by nghttp2 through the data provider for as long
+ * as the stream is open (e.g. when the peer flow control window is
+ * exhausted), so the stream can only be destroyed once nghttp2 closed it.
+ */
+void flb_http2_server_stream_release(struct flb_http_stream *stream)
+{
+    struct flb_http_server_session *parent_session;
+    void                           *stream_user_data;
+
+    if (!cfl_list_entry_is_orphan(&stream->request._head)) {
+        cfl_list_del(&stream->request._head);
+    }
+
+    parent_session = (struct flb_http_server_session *) stream->parent;
+    stream_user_data = NULL;
+
+    if (parent_session != NULL && parent_session->http2.initialized) {
+        stream_user_data = nghttp2_session_get_stream_user_data(
+                                parent_session->http2.inner_session,
+                                stream->id);
+    }
+
+    if (stream_user_data != stream) {
+        /* nghttp2 does not reference the stream anymore */
+        flb_http_stream_destroy(stream);
+
+        return;
+    }
+
+    /* http2_stream_close_callback() destroys it */
+    stream->status = HTTP_STREAM_STATUS_RELEASED;
 }
 
 /* SESSION */
@@ -439,6 +541,12 @@ static int http2_header_callback(nghttp2_session *inner_session,
         return 0;
     }
 
+    /* the request was already dispatched (or rejected) */
+    if (stream->status != HTTP_STREAM_STATUS_RECEIVING_HEADERS &&
+        stream->status != HTTP_STREAM_STATUS_RECEIVING_DATA) {
+        return 0;
+    }
+
     if (flb_http_server_strncasecmp(name, name_length, ":method", 0) == 0) {
         strncpy(temporary_buffer, 
                 (const char *) value, 
@@ -474,6 +582,11 @@ static int http2_header_callback(nghttp2_session *inner_session,
         if (stream->request.path == NULL) {
             return -1;
         }
+
+        result = flb_http_request_normalize(&stream->request);
+        if (result != 0) {
+            return -1;
+        }
     }
     else if (flb_http_server_strncasecmp(
                 name, name_length, ":authority", 0) == 0) {
@@ -495,6 +608,12 @@ static int http2_header_callback(nghttp2_session *inner_session,
     else if (flb_http_server_strncasecmp(
                 name, name_length, "content-type", 0) == 0) {
 
+        /* regular header fields can be repeated */
+        if (stream->request.content_type != NULL) {
+            cfl_sds_destroy(stream->request.content_type);
+            stream->request.content_type = NULL;
+        }
+
         stream->request.content_type = cfl_sds_create_len((const char *) value, value_length);
     
         if (stream->request.content_type == NULL) {
@@ -510,6 +629,13 @@ static int http2_header_callback(nghttp2_session *inner_session,
         temporary_buffer[sizeof(temporary_buffer) - 1] = '\0';
 
         stream->request.content_length = strtoull(temporary_buffer, NULL, 10);
+
+        if (http2_request_body_limit_exceeded(stream,
+                                              stream->request.content_length)) {
+            stream->status = HTTP_STREAM_STATUS_ERROR;
+
+            return -1;
+        }
     }
 
     result = flb_http_request_set_header(&stream->request, 
@@ -539,10 +665,33 @@ static int http2_frame_recv_callback(nghttp2_session *inner_session,
         return 0;
     }
 
+    /* frames received once the request was dispatched must not queue it again */
+    if (stream->status != HTTP_STREAM_STATUS_RECEIVING_HEADERS &&
+        stream->status != HTTP_STREAM_STATUS_RECEIVING_DATA) {
+        return 0;
+    }
+
     switch (frame->hd.type) {
         case NGHTTP2_CONTINUATION:
         case NGHTTP2_HEADERS:
             if ((frame->hd.flags & NGHTTP2_FLAG_END_HEADERS) != 0) {
+                /*
+                 * request callbacks expect the path to be set, reject the
+                 * stream, http2_stream_close_callback() releases it.
+                 */
+                if (stream->request.path == NULL) {
+                    stream->status = HTTP_STREAM_STATUS_RELEASED;
+
+                    if (nghttp2_submit_rst_stream(inner_session,
+                                                  NGHTTP2_FLAG_NONE,
+                                                  frame->hd.stream_id,
+                                                  NGHTTP2_PROTOCOL_ERROR) != 0) {
+                        return -1;
+                    }
+
+                    return 0;
+                }
+
                 stream->status = HTTP_STREAM_STATUS_RECEIVING_DATA;
             }
             else {
@@ -584,6 +733,18 @@ static int http2_stream_close_callback(nghttp2_session *session,
     stream = nghttp2_session_get_stream_user_data(session, stream_id);
 
     if (stream == NULL) {
+        return 0;
+    }
+
+    /*
+     * Streams that are not queued nor being dispatched are not referenced
+     * anywhere else, nghttp2 won't reference them after this callback.
+     */
+    if (stream->status == HTTP_STREAM_STATUS_RELEASED ||
+        stream->status == HTTP_STREAM_STATUS_RECEIVING_HEADERS ||
+        stream->status == HTTP_STREAM_STATUS_RECEIVING_DATA) {
+        flb_http_stream_destroy(stream);
+
         return 0;
     }
 
@@ -651,7 +812,18 @@ static int http2_data_chunk_recv_callback(nghttp2_session *inner_session,
         return 0;
     }
 
+    /* stream already dispatched or rejected, waiting to be closed */
+    if (stream->status == HTTP_STREAM_STATUS_RELEASED) {
+        return 0;
+    }
+
     if (stream->status != HTTP_STREAM_STATUS_RECEIVING_DATA) {
+        stream->status = HTTP_STREAM_STATUS_ERROR;
+
+        return -1;
+    }
+
+    if (http2_request_body_limit_exceeded(stream, len)) {
         stream->status = HTTP_STREAM_STATUS_ERROR;
 
         return -1;
@@ -726,6 +898,11 @@ static ssize_t http2_data_source_read_callback(nghttp2_session *session,
         return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
 
+    /* the response was already released, reset the stream */
+    if (stream->response.trailer_headers == NULL) {
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+
     if (stream->response.body != NULL) {
         body_offset    = stream->response.body_read_offset;
         content_length = cfl_sds_len(stream->response.body) - body_offset;
@@ -745,7 +922,7 @@ static ssize_t http2_data_source_read_callback(nghttp2_session *session,
     }
     else {
         if (content_length > 0) {
-            memcpy(buf, stream->response.body, content_length);
+            memcpy(buf, &stream->response.body[body_offset], content_length);
 
             stream->response.body_read_offset += content_length;
         }
@@ -761,4 +938,3 @@ static ssize_t http2_data_source_read_callback(nghttp2_session *session,
 
     return result;
 }
-

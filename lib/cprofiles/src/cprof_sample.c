@@ -40,18 +40,13 @@ int cprof_sample_add_location_index(struct cprof_sample *sample, uint64_t locati
     uint64_t *reallocated_location_index;
 
     if (sample->location_index == NULL) {
-        /*
-         * if location index is NULL, assign a default location. We set an empty string to index 0
-         * since that's the way for protobuf differentiate between unset or  NULL
-         */
         sample->location_index = calloc(1, alloc_slots * sizeof(uint64_t));
 
         if (sample->location_index == NULL) {
             return -1;
         }
 
-        sample->location_index[0] = 0; /* an empty string */
-        sample->location_index_count = 1;
+        sample->location_index_count = 0;
         sample->location_index_size = alloc_slots;
     }
 
@@ -183,6 +178,10 @@ int cprof_sample_add_timestamp(struct cprof_sample *sample, uint64_t timestamp)
 void cprof_sample_destroy(struct cprof_sample *sample)
 {
     if (sample != NULL) {
+        if (cfl_list_entry_is_orphan(&sample->_head) == CFL_FALSE) {
+            cfl_list_del(&sample->_head);
+        }
+
         if (sample->location_index) {
             free(sample->location_index);
         }
@@ -267,6 +266,10 @@ struct cprof_value_type *cprof_sample_type_str_create(struct cprof_profile *prof
 void cprof_sample_type_destroy(struct cprof_value_type *sample_type)
 {
     if (sample_type != NULL) {
+        if (cfl_list_entry_is_orphan(&sample_type->_head) == CFL_FALSE) {
+            cfl_list_del(&sample_type->_head);
+        }
+
         free(sample_type);
     }
 }

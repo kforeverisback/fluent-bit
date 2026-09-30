@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -185,6 +185,13 @@ int flb_ml_parser_builtin_create(struct flb_config *config)
     mlp = flb_ml_parser_python(config, NULL);
     if (!mlp) {
         flb_error("[multiline] could not init 'python' built-in parser");
+        goto error;
+    }
+
+    /* JSON */
+    mlp = flb_ml_parser_json(config, NULL);
+    if (!mlp) {
+        flb_error("[multiline] could not init 'json' built-in parser");
         goto error;
     }
 

@@ -22,6 +22,9 @@ on:
       - 'examples/**'
     branches:
       - master
+      - 5.0
+      - 4.2
+      - 4.1
       - 4.0
       - 3.2
       - 3.1
@@ -53,6 +56,8 @@ jobs:
           - "-DFLB_SIMD=On"
           - "-DFLB_SIMD=Off"
           - "-DFLB_ARROW=On"
+          - "-DFLB_COMPILER_STRICT_POINTER_TYPES=On"
+          - "-DFLB_AVRO_ENCODER=On -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
         cmake_version:
           - "3.31.6"
         compiler:
@@ -71,9 +76,34 @@ jobs:
             compiler:
               cc: clang
               cxx: clang++
+          - flb_option: "-DFLB_COMPILER_STRICT_POINTER_TYPES=On"
+            compiler:
+              cc: clang
+              cxx: clang++
+          - flb_option: "-DFLB_AVRO_ENCODER=On -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+            compiler:
+              cc: clang
+              cxx: clang++
     permissions:
       contents: read
     steps:
+      - name: Free disk space
+        run: |
+          echo "::group::Disk usage before cleanup"
+          df -h
+          echo "::endgroup::"
+
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/lib/jvm || true
+
+          sudo apt-get clean || true
+
+          echo "::group::Disk usage after cleanup"
+          df -h
+          echo "::endgroup::"
+
       - name: Setup environment
         run: |
           sudo apt-get update
@@ -81,16 +111,18 @@ jobs:
           sudo ln -s /usr/bin/llvm-symbolizer-12 /usr/bin/llvm-symbolizer || true
 
       - name: Install cmake
-        uses: jwlawson/actions-setup-cmake@v2
+        uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3 # v2.2.0
         with:
           cmake-version: "${{ matrix.cmake_version }}"
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: calyptia/fluent-bit-ci
+          repository: fluent/fluent-bit-ci
           path: ci
+          # Last commit to master branch
+          ref: 17eb004a1b73b1c44986c20a9f4a33fc0961ca45
       - name: Setup Apache Arrow libraries for parquet (-DFLB_ARROW=On Only)
         if: matrix.flb_option == '-DFLB_ARROW=On'
         run: |
@@ -103,6 +135,12 @@ jobs:
 
       - name: ${{ matrix.compiler.cc }} & ${{ matrix.compiler.cxx }} - ${{ matrix.flb_option }}
         run: |
+          if [[ "$FLB_OPT" =~ COVERAGE ||
+                "$FLB_OPT" =~ SANITIZE_ADDRESS ||
+                "$FLB_OPT" =~ SANITIZE_UNDEFINED ]]; then
+              # Coverage and sanitizer builds require larger coroutine stack.
+              export FLB_OPT="${FLB_OPT} -DFLB_CORO_STACK_SIZE=4194304"
+          fi
           echo "CC = $CC, CXX = $CXX, FLB_OPT = $FLB_OPT"
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 90
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-9 90
@@ -134,15 +172,17 @@ jobs:
       contents: read
     steps:
       - name: Install cmake
-        uses: jwlawson/actions-setup-cmake@v2
+        uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3 # v2.2.0
         with:
           cmake-version: "${{ matrix.cmake_version }}"
 
-      - uses: actions/checkout@v5
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: calyptia/fluent-bit-ci
+          repository: fluent/fluent-bit-ci
           path: ci
+          # Last commit to master branch
+          ref: 17eb004a1b73b1c44986c20a9f4a33fc0961ca45
 
       - name: ${{ matrix.flb_option }}
         run: |
@@ -178,7 +218,7 @@ jobs:
 
     steps:
       - name: Checkout Fluent Bit code
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup environment
         run: |
@@ -240,10 +280,10 @@ jobs:
           - riscv64
     steps:
       - name: Checkout Fluent Bit code
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Prepare and build with QEMU ${{ matrix.arch }}
-        uses: uraimo/run-on-arch-action@v3
+        uses: uraimo/run-on-arch-action@fa1f3e7de95534497266c7265950b5188355fbfb # v3.2.1
         id: build-and-test-on-qemu
         with:
           arch: ${{ matrix.arch }}

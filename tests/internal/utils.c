@@ -2,6 +2,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_mem.h>
+#include <fluent-bit/flb_simd.h>
 #include <fluent-bit/flb_utils.h>
 #include <stdarg.h>
 #include "flb_tests_internal.h"
@@ -36,6 +37,49 @@ struct url_check url_checks[] = {
     {0, "https://fluentbit.io:1234/", "https", "fluentbit.io", "1234", "/"},
     {0, "https://fluentbit.io:1234/v", "https", "fluentbit.io", "1234", "/v"},
     {-1, "://", NULL, NULL, NULL, NULL},
+    // IPv6 tests
+    {0, "https://[::1]/something", "https", "::1", "443", "/something"},
+    {0, "http://[::1]/something", "http", "::1", "80", "/something"},
+    {0, "https://[::1]", "https", "::1", "443", "/"},
+    {0, "https://[::1]:1234/something", "https", "::1", "1234", "/something"},
+    {0, "http://[::1]:1234", "http", "::1", "1234", "/"},
+    {0, "http://[::1]:1234/", "http", "::1", "1234", "/"},
+    {0, "http://[::1]:1234/v", "http", "::1", "1234", "/v"},
+    {0, "https://[2001:db8::1]", "https", "2001:db8::1", "443", "/"},
+    {0, "https://[2001:db8::1]:1234/something", "https", "2001:db8::1", "1234", "/something"},
+    {0, "http://[2001:0db8:0000:0000:0000:0000:0000:0001]:1234/something", "http", "2001:0db8:0000:0000:0000:0000:0000:0001", "1234", "/something"},
+    {0, "https://[::192.9.5.5]:1234/v", "https", "::192.9.5.5", "1234", "/v"},
+    {0, "https://[::1]/path?query=[value]", "https", "::1", "443", "/path?query=[value]"},
+    /* Query string with brackets (no path) */
+    {0, "https://example.com?query=[1]", "https", "example.com", "443", "/?query=[1]"},
+    {0, "http://example.com?query=[value]&other=[2]", "http", "example.com", "80", "/?query=[value]&other=[2]"},
+    {0, "https://[::1]?query=[value]", "https", "::1", "443", "/?query=[value]"},
+    {0, "https://[2001:db8::1]:8080?query=[1]", "https", "2001:db8::1", "8080", "/?query=[1]"},
+    /* Fragment with brackets */
+    {0, "https://example.com#fragment=[1]", "https", "example.com", "443", "/#fragment=[1]"},
+    {0, "https://[::1]#fragment=[value]", "https", "::1", "443", "/#fragment=[value]"},
+    /* Query and fragment with brackets */
+    {0, "https://example.com?query=[1]#fragment=[2]", "https", "example.com", "443", "/?query=[1]#fragment=[2]"},
+    /* Port with query/fragment (non-IPv6) */
+    {0, "https://example.com:8080?query=[1]", "https", "example.com", "8080", "/?query=[1]"},
+    {0, "http://example.com:9000#fragment=[1]", "http", "example.com", "9000", "/#fragment=[1]"},
+    /* Empty query/fragment */
+    {0, "https://example.com?", "https", "example.com", "443", "/?"},
+    {0, "https://example.com#", "https", "example.com", "443", "/#"},
+    {0, "https://[::1]?", "https", "::1", "443", "/?"},
+    /* IPv6 edge cases - malformed brackets */
+    {-1, "http://[::1:8080/path", NULL, NULL, NULL, NULL},  /* missing closing bracket */
+    {-1, "http://::1]:8080/path", NULL, NULL, NULL, NULL},  /* missing opening bracket in host */
+    {-1, "http://[]:8080/path", NULL, NULL, NULL, NULL},    /* empty brackets */
+    {-1, "http://host]name.com/path", NULL, NULL, NULL, NULL},  /* closing bracket in hostname without opening */
+    {-1, "http://host]name.com?query=1", NULL, NULL, NULL, NULL},  /* closing bracket in hostname without opening (query) */
+    /* Colons in query/fragment should not be treated as port separators */
+    {0, "https://example.com?q=a:b", "https", "example.com", "443", "/?q=a:b"},
+    {0, "https://example.com/path?time=12:30:45", "https", "example.com", "443", "/path?time=12:30:45"},
+    {0, "http://example.com#section:subsection", "http", "example.com", "80", "/#section:subsection"},
+    {0, "https://example.com?q=a:b#frag:ment", "https", "example.com", "443", "/?q=a:b#frag:ment"},
+    {0, "https://[::1]?time=12:30", "https", "::1", "443", "/?time=12:30"},
+    {0, "http://example.com:8080?q=a:b:c", "http", "example.com", "8080", "/?q=a:b:c"}
 };
 
 void test_url_split_sds()
@@ -294,6 +338,67 @@ void test_write_str()
     off = 0;
     ret = flb_utils_write_str(buf, &off, size, "aaaaaaaaaaa", 11, FLB_TRUE);
     TEST_CHECK(ret == FLB_FALSE);
+}
+
+static void check_write_str_simd_boundary(size_t input_len)
+{
+    int off;
+    int ret;
+    size_t output_size;
+    char *input;
+    char *output;
+
+    output_size = input_len + FLB_SIMD_VEC8_INST_LEN + 8;
+
+    input = flb_malloc(input_len + FLB_SIMD_VEC8_INST_LEN);
+    output = flb_calloc(output_size, sizeof(char));
+    if (!TEST_CHECK(input != NULL && output != NULL)) {
+        flb_free(input);
+        flb_free(output);
+        return;
+    }
+
+    /*
+     * A multibyte character moves the input cursor off its original SIMD
+     * alignment. Poison the bytes beyond the declared string length to catch
+     * a subsequent vector copy that crosses that boundary.
+     */
+    memset(input, 'x', input_len + FLB_SIMD_VEC8_INST_LEN);
+    input[0] = '\xc2';
+    input[1] = '\xae';
+
+    off = 0;
+    ret = flb_utils_write_str(output, &off, output_size, input, input_len, FLB_TRUE);
+    TEST_CHECK(ret == FLB_TRUE);
+    TEST_CHECK_(off == input_len + 4, "expected %zu escaped bytes, got %d",
+                input_len + 4, off);
+    TEST_CHECK(memcmp(output, "\\u00ae", 6) == 0);
+    TEST_CHECK(memcmp(output + 6, input + 2, input_len - 2) == 0);
+
+    memset(output, 0, output_size);
+    off = 0;
+    ret = flb_utils_write_str(output, &off, output_size, input, input_len, FLB_FALSE);
+    TEST_CHECK(ret == FLB_TRUE);
+    TEST_CHECK_(off == input_len, "expected %zu raw bytes, got %d", input_len, off);
+    TEST_CHECK(memcmp(output, input, input_len) == 0);
+
+    flb_free(input);
+    flb_free(output);
+}
+
+void test_write_str_simd_boundary()
+{
+    size_t i;
+    size_t input_lengths[] = {
+        FLB_SIMD_VEC8_INST_LEN * 2,
+        /* Historical x86_64 and arm64 macOS coroutine stack sizes. */
+        24 * 1024,
+        36 * 1024
+    };
+
+    for (i = 0; i < sizeof(input_lengths) / sizeof(input_lengths[0]); i++) {
+        check_write_str_simd_boundary(input_lengths[i]);
+    }
 }
 
 void test_write_str_invalid_trailing_bytes()
@@ -615,8 +720,26 @@ struct proxy_url_check proxy_url_checks[] = {
     /* issue #5530. Password contains @ */
     {0, "http://example_user:example_pass_w_@_char@proxy.com:8080",
      "http", "proxy.com", "8080", "example_user", "example_pass_w_@_char"},
-    {-1, "https://proxy.com:8080",
-     NULL, NULL, NULL, NULL, NULL}
+    /* HTTPS proxy cases: accepted only when TLS support is compiled in */
+#ifdef FLB_HAVE_TLS
+    /* HTTPS proxy with explicit port */
+    {0, "https://proxy.com:8080",
+     "https", "proxy.com", "8080", NULL, NULL},
+    /* HTTPS proxy, default port 443 */
+    {0, "https://proxy.com",
+     "https", "proxy.com", "443", NULL, NULL},
+    /* HTTPS proxy with credentials */
+    {0, "https://user:pass@proxy.com:443",
+     "https", "proxy.com", "443", "user", "pass"},
+#else
+    /* Without TLS support, HTTPS proxy URLs must be rejected */
+    {-1, "https://proxy.com:8080",       NULL, NULL, NULL, NULL, NULL},
+    {-1, "https://proxy.com",            NULL, NULL, NULL, NULL, NULL},
+    {-1, "https://user:pass@proxy.com:443", NULL, NULL, NULL, NULL, NULL},
+#endif
+    /* Unsupported schemes must be rejected */
+    {-1, "ftp://proxy.com:21",  NULL, NULL, NULL, NULL, NULL},
+    {-1, "socks5://proxy.com", NULL, NULL, NULL, NULL, NULL},
 
 };
 
@@ -962,6 +1085,7 @@ TEST_LIST = {
     { "url_split", test_url_split },
     { "url_split_sds", test_url_split_sds },
     { "write_str", test_write_str },
+    { "write_str_simd_boundary", test_write_str_simd_boundary },
     { "write_str_special_bytes", test_write_str_special_bytes },
     { "write_raw_str_special_bytes", test_write_raw_str_special_bytes },
     { "write_raw_str_invalid_bytes", test_write_raw_str_invalid_sequences},

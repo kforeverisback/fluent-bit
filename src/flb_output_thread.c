@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -309,6 +309,13 @@ static void output_thread(void *data)
                                                         th_ins->ins,
                                                         th_ins->config);
                     if (!out_flush) {
+                        /*
+                         * The engine already counts this worker as a user
+                         * of the task and waits for the route status:
+                         * report the error so the task gets released
+                         * instead of being retained forever.
+                         */
+                        flb_output_task_flush_error(task, ins);
                         continue;
                     }
                     flb_coro_resume(out_flush->coro);
@@ -402,7 +409,7 @@ static void output_thread(void *data)
     }
 
     sched_params = (struct flb_sched_timer_coro_cb_params *) FLB_TLS_GET(sched_timer_coro_cb_params);
-    if (sched_params != NULL) {
+    if (sched_params != NULL && sched_params->magic == FLB_SCHED_TLS_MAGIC) {
         flb_free(sched_params);
         FLB_TLS_SET(sched_timer_coro_cb_params, NULL);
     }

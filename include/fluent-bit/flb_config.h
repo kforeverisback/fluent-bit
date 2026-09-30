@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2024 The Fluent Bit Authors
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,8 +27,12 @@
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_task_map.h>
+#include <cfl/cfl.h>
 
 #include <monkey/mk_core.h>
+
+struct flb_router;
+struct flb_hash_table;
 
 #define FLB_CONFIG_FLUSH_SECS   1
 #define FLB_CONFIG_HTTP_LISTEN  "0.0.0.0"
@@ -52,6 +56,27 @@
  * pointers.
  */
 
+/*
+ * Maximum number of flush requests in flight (dispatched to an output and
+ * whose return status has not been processed by the engine yet).
+ *
+ * Flush requests and their return status travel through pipes written with
+ * blocking calls: the engine hands the task to the output (worker
+ * 'ch_parent_events' or engine 'ch_self_events') and the output reports the
+ * status back through the instance 'ch_events' channel, which is only drained
+ * by the engine event loop. Each request takes an 8 bytes slot and pipes can
+ * hold 64KiB on Linux (8192 slots) but only 16KiB on other systems, so if more
+ * requests than that are dispatched at once the engine and the output
+ * workers end up blocked on each other forever. Keep the number of requests
+ * in flight below the pipe capacity, the remaining tasks are started on the
+ * next flush cycle.
+ */
+#ifdef __linux__
+#define FLB_CONFIG_FLUSH_IN_FLIGHT_LIMIT  4096
+#else
+#define FLB_CONFIG_FLUSH_IN_FLIGHT_LIMIT  1024
+#endif
+
 /* Main struct to hold the configuration of the runtime service */
 struct flb_config {
     struct mk_event ch_event;
@@ -61,6 +86,18 @@ struct flb_config {
     int is_shutting_down;     /* is the service shutting down ? */
     int is_running;           /* service running ?              */
     double flush;             /* Flush timeout                  */
+    int flush_adaptive;       /* Enable adaptive flush interval */
+    double flush_adaptive_min_interval;
+    double flush_adaptive_max_interval;
+    double flush_adaptive_low_pressure;
+    double flush_adaptive_medium_pressure;
+    double flush_adaptive_high_pressure;
+    int flush_adaptive_up_steps;
+    int flush_adaptive_down_steps;
+    int flush_adaptive_level;
+    int flush_adaptive_hits;
+    int flush_adaptive_direction;
+    double flush_adaptive_current_interval;
 
     /*
      * Maximum grace time on shutdown. If set to -1, the engine will
@@ -196,6 +233,17 @@ struct flb_config {
      */
     struct mk_list cmetrics;
 
+    /*
+     * Optional telemetry metrics with user-controlled cardinality.
+     */
+    int telemetry_metrics_logs_tag_records;
+    int telemetry_metrics_logs_tag_records_max_series;
+    int telemetry_metrics_logs_tag_records_max_tag_length;
+    size_t telemetry_metrics_logs_tag_records_series_count;
+    struct flb_hash_table *telemetry_metrics_logs_tag_records_ht;
+    pthread_mutex_t telemetry_metrics_logs_tag_records_lock;
+    int telemetry_metrics_logs_tag_records_lock_inited;
+
     /* HTTP Server */
 #ifdef FLB_HAVE_HTTP_SERVER
     int http_server;                /* HTTP Server running    */
@@ -251,6 +299,12 @@ struct flb_config {
     char *storage_type;             /* global storage type */
     int   storage_inherit;          /* apply storage type to inputs */
 
+    /* DLQ for non-retriable output failures */
+    int   storage_keep_rejected;     /* 0/1 */
+    char *storage_rejected_path;     /* relative to storage_path, default "rejected" */
+    char *storage_rejected_limit;    /* maximum total bytes in DLQ stream */
+    void *storage_rejected_stream;  /* NULL until first use */
+
     /* Embedded SQL Database support (SQLite3) */
 #ifdef FLB_HAVE_SQLDB
     struct mk_list sqldb_list;
@@ -282,6 +336,9 @@ struct flb_config {
     int enable_chunk_trace;
 #endif /* FLB_HAVE_CHUNK_TRACE */
 
+    int fips_mode;
+    int fips_mode_active;
+
     int enable_hot_reload;
     int ensure_thread_safety_on_hot_reloading;
     unsigned int hot_reloaded_count;
@@ -292,9 +349,7 @@ struct flb_config {
     int hot_reload_watchdog_timeout_seconds;
 
     /* Routing */
-    size_t route_mask_size;
-    size_t route_mask_slots;
-    uint64_t *route_empty_mask;
+    struct flb_router *router;
 #ifdef FLB_SYSTEM_WINDOWS
     /* maxstdio (Windows) */
     int win_maxstdio;
@@ -322,9 +377,16 @@ struct flb_config {
     struct flb_task_map *task_map;
     size_t task_map_size;
 
+    /* flush requests dispatched to outputs whose status is pending */
+    int flush_in_flight;
+    int flush_in_flight_limit;
+
     int json_escape_unicode;
 
     int dry_run;
+
+    /* New Router Configuration */
+    struct cfl_list input_routes;
 };
 
 #define FLB_CONFIG_LOG_LEVEL(c) (c->log->level)
@@ -332,6 +394,7 @@ struct flb_config {
 struct flb_config *flb_config_init();
 void flb_config_exit(struct flb_config *config);
 const char *flb_config_prop_get(const char *key, struct mk_list *list);
+int flb_config_service_property_is_valid(const char *k);
 int flb_config_set_property(struct flb_config *config,
                             const char *k, const char *v);
 int flb_config_set_program_name(struct flb_config *config, char *name);
@@ -359,6 +422,14 @@ enum conf_type {
 };
 
 #define FLB_CONF_STR_FLUSH        "Flush"
+#define FLB_CONF_STR_FLUSH_ADAPTIVE "flush.adaptive"
+#define FLB_CONF_STR_FLUSH_ADAPTIVE_MIN "flush.adaptive.min_interval"
+#define FLB_CONF_STR_FLUSH_ADAPTIVE_MAX "flush.adaptive.max_interval"
+#define FLB_CONF_STR_FLUSH_ADAPTIVE_LOW "flush.adaptive.low_pressure"
+#define FLB_CONF_STR_FLUSH_ADAPTIVE_MEDIUM "flush.adaptive.medium_pressure"
+#define FLB_CONF_STR_FLUSH_ADAPTIVE_HIGH "flush.adaptive.high_pressure"
+#define FLB_CONF_STR_FLUSH_ADAPTIVE_UP_STEPS "flush.adaptive.up_steps"
+#define FLB_CONF_STR_FLUSH_ADAPTIVE_DOWN_STEPS "flush.adaptive.down_steps"
 #define FLB_CONF_STR_GRACE        "Grace"
 #define FLB_CONF_STR_DAEMON       "Daemon"
 #define FLB_CONF_STR_LOGFILE      "Log_File"
@@ -368,6 +439,7 @@ enum conf_type {
 #define FLB_CONF_STR_STREAMS_FILE "Streams_File"
 #define FLB_CONF_STR_STREAMS_STR_CONV "sp.convert_from_str_to_num"
 #define FLB_CONF_STR_CONV_NAN     "json.convert_nan_to_null"
+#define FLB_CONF_STR_FIPS_MODE    "security.fips_mode"
 
 /* FLB_HAVE_HTTP_SERVER */
 #ifdef FLB_HAVE_HTTP_SERVER
@@ -411,6 +483,10 @@ enum conf_type {
 #define FLB_CONF_STORAGE_TRIM_FILES    "storage.trim_files"
 #define FLB_CONF_STORAGE_TYPE          "storage.type"
 #define FLB_CONF_STORAGE_INHERIT       "storage.inherit"
+/* Storage DLQ */
+#define FLB_CONF_STORAGE_KEEP_REJECTED "storage.keep.rejected"
+#define FLB_CONF_STORAGE_REJECTED_PATH "storage.rejected.path"
+#define FLB_CONF_STORAGE_REJECTED_LIMIT "storage.rejected.limit"
 
 /* Coroutines */
 #define FLB_CONF_STR_CORO_STACK_SIZE "Coro_Stack_Size"

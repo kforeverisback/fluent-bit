@@ -5,8 +5,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # CMetrics Version
 set(CPROF_VERSION_MAJOR  0)
-set(CPROF_VERSION_MINOR  1)
-set(CPROF_VERSION_PATCH  1)
+set(CPROF_VERSION_MINOR  2)
+set(CPROF_VERSION_PATCH  2)
 set(CPROF_VERSION_STR "${CPROF_VERSION_MAJOR}.${CPROF_VERSION_MINOR}.${CPROF_VERSION_PATCH}")
 
 # Include helpers
@@ -250,7 +250,7 @@ endif()
 # Installer Generation (Cpack)
 # ============================
 
-set(CPACK_PACKAGE_VERSION ${CPROFILES_VERSION_STR})
+set(CPACK_PACKAGE_VERSION ${CPROF_VERSION_STR})
 set(CPACK_PACKAGE_NAME "cprofiles")
 set(CPACK_PACKAGE_RELEASE 1)
 set(CPACK_PACKAGE_CONTACT "Eduardo Silva <eduardo@calyptia.com>")
