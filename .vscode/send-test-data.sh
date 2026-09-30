@@ -22,11 +22,12 @@
 
 set -euo pipefail
 
-AZURE_TENANT_ID="${AZURE_TENANT_ID:-16b3c013-d300-468d-ac64-7eda0820b6d3}"
-AZURE_CLIENT_ID="${AZURE_CLIENT_ID:-bd7a6599-6424-4398-98b4-c47cfbee8a60}"
-AZURE_CLIENT_SECRET="${AZURE_CLIENT_SECRET:-Xhr8Q~Wxc6xfJguR3WUJe6OURsAsE2TrqdzIVaa0}"
-DCE_ENDPOINT="${DCE_ENDPOINT:-https://la-dce-kushal-anii.eastus-1.ingest.monitor.azure.com}"
-DCR_IMMUTABLE_ID="${DCR_IMMUTABLE_ID:-dcr-112477e60a1f4c69bf420b75314b5cd5}"
+env_file="$(dirname "$0")/.env"
+if [[ -f "$env_file" ]]; then
+    echo "Sourcing $env_file"
+    source "$env_file"
+fi
+
 STREAM_NAME="${STREAM_NAME:-Custom-Syslog}"
 AZURE_CLOUD_AUDIENCE="${AZURE_CLOUD_AUDIENCE:-https://monitor.azure.com}"
 PAYLOAD_FILE=""
