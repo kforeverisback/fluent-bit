@@ -1,0 +1,110 @@
+{
+	"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+	"contentVersion": "1.2.0.0",
+	"parameters": {
+		"dataCollectionRuleName": {
+			"type": "string",
+			"metadata": {
+				"description": "Specifies the name of the Data Collection Rule to create."
+			}
+		},
+		"location": {
+			"type": "string",
+			"defaultValue": "[resourceGroup().location]",
+			"metadata": {
+				"description": "Specifies the location in which to create the Data Collection Rule."
+			}
+		},
+		"workspaceResourceId": {
+			"type": "string",
+			"metadata": {
+				"description": "Specifies the Azure resource ID of the Log Analytics workspace to use."
+			}
+		},
+		"endpointResourceId": {
+			"type": "string",
+			"metadata": {
+				"description": "Specifies the Azure resource ID of the Data Collection Endpoint to use."
+			}
+		}
+	},
+	"resources": [
+		{
+			"type": "Microsoft.Insights/dataCollectionRules",
+			"apiVersion": "2021-09-01-preview",
+			"name": "[parameters('dataCollectionRuleName')]",
+			"location": "[parameters('location')]",
+			"properties": {
+				"dataCollectionEndpointId": "[parameters('endpointResourceId')]",
+				"streamDeclarations": {
+					"Custom-Syslog": {
+						"columns": [
+							{
+								"name": "TimeGenerated",
+								"type": "datetime"
+							},
+							{
+								"name": "Computer",
+								"type": "string"
+							},
+							{
+								"name": "Facility",
+								"type": "string"
+							},
+							{
+								"name": "HostIP",
+								"type": "string"
+							},
+							{
+								"name": "HostName",
+								"type": "string"
+							},
+							{
+								"name": "ProcessID",
+								"type": "int"
+							},
+							{
+								"name": "ProcessName",
+								"type": "string"
+							},
+							{
+								"name": "SeverityLevel",
+								"type": "string"
+							},
+							{
+								"name": "SyslogMessage",
+								"type": "string"
+							}
+						]
+					}
+				},
+				"destinations": {
+					"logAnalytics": [
+						{
+							"workspaceResourceId": "[parameters('workspaceResourceId')]",
+							"name": "clv2ws1"
+						}
+					]
+				},
+				"dataFlows": [
+					{
+						"streams": [
+							"Custom-Syslog"
+						],
+						"destinations": [
+							"clv2ws1"
+						],
+						"transformKql": "source",
+						"outputStream": "Microsoft-Syslog"
+					}
+				]
+			}
+		}
+	],
+	"outputs": {
+		"dataCollectionRuleId": {
+			"type": "string",
+			"value": "[resourceId('Microsoft.Insights/dataCollectionRules', parameters('dataCollectionRuleName'))]"
+		}
+	}
+}
